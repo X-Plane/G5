@@ -849,6 +849,11 @@ function XPluginStart()
     config.fd_cue = string.lower(tostring(config.fd_cue))
     config.show_battery = string.lower(tostring(config.show_battery))
     config.roll_pointer = string.lower(tostring(config.roll_pointer))
+    -- VSI range: only the two scales there is artwork for
+    if config.vsi_scale ~= 15 and config.vsi_scale ~= 30 then
+        log("config.ini: vsi_scale = " .. tostring(config.vsi_scale) .. " is not valid (15 | 30), using 15")
+        config.vsi_scale = 15
+    end
     if config.roll_pointer ~= "ground" and config.roll_pointer ~= "sky" then
         log("config.ini: roll_pointer = '" .. config.roll_pointer .. "' is not valid, using ground")
         config.roll_pointer = "ground"
