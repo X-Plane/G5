@@ -39,3 +39,9 @@ luac.out
 *.x86_64
 *.hex
 
+
+# G5: the cockpit models are part of the instrument
+!3D/*.obj
+
+# G5: runtime state written by the plugin (battery charge, configuration mode values)
+state_unit*.ini
