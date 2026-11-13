@@ -263,7 +263,22 @@ end
 local cam = { ok = false }
 local proj_m = {}
 
+-- The camera of the last frame drawn (CG frame), read in a window's draw
+-- callback: pos, axes, projection, t (XPLMGetElapsedTime, s).
+local drawn = { t = nil }
+-- Older than this (no window drawn for a while): the head and the flight loop.
+local DRAWN_MAX_AGE_S = 0.25
+-- A drawn camera this far from the pilot's head is not the cockpit's (a G-load
+-- or head-tracking move is centimetres).
+local DRAWN_MAX_OFF_M = 0.5
+-- Older than DRAWN_MAX_AGE_S but younger than this: the head plus the last
+-- drawn offset from it (windows that step aside stop the readings, and a jump
+-- back to the head would move the outline).
+local DRAWN_HOLD_S = 2
+
 local function num(x) return tonumber(tostring(x)) or 0 end
+
+local function now() return XPLMGetElapsedTime and num(XPLMGetElapsedTime()) or nil end
 
 local function bounds()
     local b = XPLMGetScreenBoundsGlobal()
@@ -281,6 +296,25 @@ local function mouse_xy()
     return num(m.outX or m[1]), num(m.outY or m[2])
 end
 
+-- The screen bounds taken for the 3D view fit X-Plane's window: false when they
+-- do not (more than 2 % apart in shape: a multi-monitor or an odd windowed /
+-- high-DPI layout, where the mouse ray would miss the unit).
+local view_fits = nil
+
+-- The projection X-Plane really used for the last 3D frame. It includes the
+-- mouse-wheel zoom, which field_of_view_deg does not (zoomed 72.5 deg showed
+-- as 38 deg). OpenGL column-major: m[0] = 1/tan_h, m[5] = 1/tan_v, m[8]/m[9]
+-- = frustum shift. Into c; false if not readable.
+local function read_projection(c)
+    local m = proj_m
+    local ok = dr.proj and XPLMGetDatavf(dr.proj, m, 0, 16) == 16
+        and m[1] and m[6] and m[1] > 0.05 and m[6] > 0.05 and m[11] and m[11] < 0
+    if not ok then return false end
+    c.tan_h, c.tan_v = 1 / m[1], 1 / m[6]
+    c.shift_x, c.shift_y = -m[9], -m[10]
+    return true
+end
+
 local function update_camera()
     cam.ok = false
     if XPLMGetDatai(dr.view_type) ~= 1026 then return end          -- 3D cockpit only
@@ -288,27 +322,37 @@ local function update_camera()
     local l, t, r, b = bounds()
     if r - l < 10 or t - b < 10 then return end
     local ww, wh = XPLMGetDatai(dr.win_w), XPLMGetDatai(dr.win_h)
+    local fits = not (ww > 0 and wh > 0) or math.abs((r - l) / (t - b) / (ww / wh) - 1) <= 0.02
+    if fits ~= view_fits then
+        view_fits = fits
+        log(string.format("pick: screen %.0f x %.0f, X-Plane window %.0f x %.0f px: %s", r - l, t - b, ww, wh,
+            fits and "3D clicks on" or "not the same shape, 3D clicks off (the popup and the commands still work)"))
+    end
+    if not fits then return end
     local aspect = (ww > 0 and wh > 0) and (ww / wh) or ((r - l) / (t - b))
     cam.l, cam.t, cam.r, cam.b = l, t, r, b
-    -- The projection X-Plane really used for the last 3D frame. It includes the
-    -- mouse-wheel zoom, which field_of_view_deg does not (zoomed 72.5 deg showed
-    -- as 38 deg). OpenGL column-major: m[0] = 1/tan_h, m[5] = 1/tan_v, m[8]/m[9]
-    -- = frustum shift.
-    local m = proj_m
-    local ok = dr.proj and XPLMGetDatavf(dr.proj, m, 0, 16) == 16
-        and m[1] and m[6] and m[1] > 0.05 and m[6] > 0.05 and m[11] and m[11] < 0
-    if ok then
-        cam.tan_h, cam.tan_v = 1 / m[1], 1 / m[6]
-        cam.shift_x, cam.shift_y = -m[9], -m[10]
-    else
+    if not read_projection(cam) then
         cam.tan_h = tan(rad(XPLMGetDataf(dr.fov) * 0.5))
         cam.tan_v = cam.tan_h / aspect
         cam.shift_x = XPLMGetDataf(dr.fov_hr) * 2      -- frustum shift, 1 = one screen width
         cam.shift_y = XPLMGetDataf(dr.fov_vr) * 2
     end
-    -- position: the pilot's head in the aircraft frame (exact; the world-space
-    -- view_x/y/z floats lose millimetres far from the local origin)
+    -- the reading from the last drawn frame, when it is fresh
+    local tn = now()
+    if drawn.t and tn and tn >= drawn.t and tn - drawn.t <= DRAWN_MAX_AGE_S then
+        cam.pos, cam.ax_r, cam.ax_u, cam.ax_b = drawn.pos, drawn.ax_r, drawn.ax_u, drawn.ax_b
+        if drawn.tan_h then
+            cam.tan_h, cam.tan_v, cam.shift_x, cam.shift_y = drawn.tan_h, drawn.tan_v, drawn.shift_x, drawn.shift_y
+        end
+        cam.ok = true
+        return
+    end
+    -- position: the pilot's head in the aircraft frame (without the G-loaded
+    -- camera's movement), plus the last drawn offset for a while
     cam.pos = { XPLMGetDataf(dr.hx), XPLMGetDataf(dr.hy), XPLMGetDataf(dr.hz) }
+    if drawn.off and tn and tn >= drawn.t and tn - drawn.t <= DRAWN_HOLD_S then
+        cam.pos = add(cam.pos, drawn.off)
+    end
     -- orientation: the camera X-Plane really rendered (world view angles, which
     -- include the aircraft attitude), brought into the aircraft frame. The head
     -- angles alone were off by ~25 px at large head yaw with the aircraft pitched.
@@ -317,6 +361,51 @@ local function update_camera()
     local function axis(v) return to_child(to_parent(v, vh, vp, vr), ah, ap, ar) end
     cam.ax_r, cam.ax_u, cam.ax_b = axis({ 1, 0, 0 }), axis({ 0, 1, 0 }), axis({ 0, 0, 1 })
     cam.ok = true
+end
+
+-- In a window's draw callback: the camera of the frame on screen. The view
+-- angles and the attitude of the same frame give the axes, and the projection
+-- of the same frame goes with them (a zoom in progress). Position: view_x/y/z
+-- minus local_x/y/z turned into the aircraft frame (the head moved by the
+-- G-loaded camera, head tracking, a view change on its way); the pilot's head
+-- (exact) when that is within twice the float step of view_x/y/z (millimetres
+-- far from the local origin) or not the cockpit camera.
+local function capture_camera()
+    if XPLMGetDatai(dr.view_type) ~= 1026 then return end
+    local t = now()
+    if not t then return end
+    local vh, vp, vr = XPLMGetDataf(dr.vhdg), XPLMGetDataf(dr.vpitch), XPLMGetDataf(dr.vroll)
+    local ah, ap, ar = XPLMGetDataf(dr.apsi), XPLMGetDataf(dr.athe), XPLMGetDataf(dr.aphi)
+    local function axis(v) return to_child(to_parent(v, vh, vp, vr), ah, ap, ar) end
+    local head = { XPLMGetDataf(dr.hx), XPLMGetDataf(dr.hy), XPLMGetDataf(dr.hz) }
+    local pos = head
+    if dr.vx and dr.vy and dr.vz and dr.lx and dr.ly and dr.lz then
+        local vx, vy, vz = XPLMGetDataf(dr.vx), XPLMGetDataf(dr.vy), XPLMGetDataf(dr.vz)
+        -- local_x/y/z as doubles (a float drops millimetres)
+        local getd = XPLMGetDatad or XPLMGetDataf
+        local p = to_child({ vx - getd(dr.lx), vy - getd(dr.ly), vz - getd(dr.lz) }, ah, ap, ar)
+        local off = sub(p, head)
+        local d = math.sqrt(dot(off, off))
+        local step = math.max(math.abs(vx), math.abs(vy), math.abs(vz)) / 8388608      -- 2^-23
+        if d > 2 * step and d <= DRAWN_MAX_OFF_M then
+            pos = p
+            if not drawn.moved then
+                drawn.moved = true
+                log(string.format("pick: camera from the drawn view (%.0f mm from the pilot's head)", d * 1000))
+            end
+        end
+    end
+    drawn.off = sub(pos, head)
+    drawn.pos, drawn.t = pos, t
+    drawn.ax_r, drawn.ax_u, drawn.ax_b = axis({ 1, 0, 0 }), axis({ 0, 1, 0 }), axis({ 0, 0, 1 })
+    if not read_projection(drawn) then drawn.tan_h = nil end
+    -- the clicks that come before the next flight loop
+    if cam.ok then
+        cam.pos, cam.ax_r, cam.ax_u, cam.ax_b = drawn.pos, drawn.ax_r, drawn.ax_u, drawn.ax_b
+        if drawn.tan_h then
+            cam.tan_h, cam.tan_v, cam.shift_x, cam.shift_y = drawn.tan_h, drawn.tan_v, drawn.shift_x, drawn.shift_y
+        end
+    end
 end
 
 -- CG-frame vector -> camera frame (x right, y up, z toward the viewer)
@@ -388,7 +477,7 @@ end
 -- Hit test
 -----------------------------------------------------------------------------
 
--- nearest manipulator hit for a group: batch, slot, hit point (CG frame)
+-- nearest manipulator hit for a group: batch, slot, distance along the ray
 local function hit_group(g, x, y)
     if not cam.ok then return nil end
     local o, d = mouse_ray(x, y)
@@ -406,7 +495,21 @@ local function hit_group(g, x, y)
             end
         end
     end
-    return bb, bs
+    return bb, bs, best
+end
+
+-- The nearest control under the mouse in any group. The windows are the
+-- groups' screen rectangles, so they can overlap (seen at an angle, one
+-- group's rectangle reaches over the other's controls), and the window that
+-- gets a click is not always the group's own: a click must find its control
+-- whichever window receives it. Returns batch, slot, group.
+local function hit_any(x, y)
+    local best, bb, bs, bg = nil, nil, nil, nil
+    for _, o in ipairs(groups) do
+        local b, s, d = hit_group(o, x, y)
+        if b and (not best or d < best) then best, bb, bs, bg = d, b, s, o end
+    end
+    return bb, bs, bg
 end
 
 -- which command of a "pair" batch: screen side of the batch centre
@@ -438,14 +541,20 @@ local function end_active()
 end
 
 local function on_draw(win, g)
-    -- invisible: the window only catches the mouse over the G5 controls
+    -- invisible: the window only catches the mouse over the G5 controls, and
+    -- reads the camera of the frame on screen
+    local ok, err = pcall(capture_camera)
+    if not ok and not drawn.err then
+        drawn.err = true
+        log("pick: camera capture error " .. tostring(err))
+    end
 end
 
 local function on_click(win, x, y, mouse, g)
     local ok, ret = pcall(function()
         if mouse == XPLMMouseStatus.xplm_MouseDown then
             end_active()
-            local b, s = hit_group(g, x, y)
+            local b, s = hit_any(x, y)
             if not b then return config.pick_pass_misses ~= 0 and 0 or 1 end
             local i = (b.kind == "pair") and pair_index(b, s, x, y) or 1
             local c = b.cmds[i]
@@ -470,7 +579,7 @@ end
 
 local function on_cursor(win, x, y, g)
     local ok, ret = pcall(function()
-        local b, s = hit_group(g, x, y)
+        local b, s = hit_any(x, y)
         if not b then return XPLMCursorStatus.xplm_CursorDefault end
         local name = b.cursor or "hand"
         if b.kind == "pair" and name:match("^rotate_%a+$") and b.axis == "x" then
@@ -484,9 +593,9 @@ end
 
 local function on_wheel(win, x, y, wheel, clicks, g)
     local ok, ret = pcall(function()
-        local b = hit_group(g, x, y)
+        local b, _, bg = hit_any(x, y)
         if not b then return false end
-        local w = wheel_batch(g, b)
+        local w = wheel_batch(bg, b)
         if w and wheel == 0 and clicks ~= 0 then
             local c = (clicks > 0) and w.cmds[1] or w.cmds[2]
             for _ = 1, math.min(math.abs(clicks), 10) do XPLMCommandOnce(c) end
@@ -638,6 +747,13 @@ function P.enable()
     dr.hx = find("sim/graphics/view/pilots_head_x")
     dr.hy = find("sim/graphics/view/pilots_head_y")
     dr.hz = find("sim/graphics/view/pilots_head_z")
+    -- the drawn camera (optional: without them the pilot's head is used)
+    dr.vx = XPLMFindDataRef("sim/graphics/view/view_x")
+    dr.vy = XPLMFindDataRef("sim/graphics/view/view_y")
+    dr.vz = XPLMFindDataRef("sim/graphics/view/view_z")
+    dr.lx = XPLMFindDataRef("sim/flightmodel/position/local_x")
+    dr.ly = XPLMFindDataRef("sim/flightmodel/position/local_y")
+    dr.lz = XPLMFindDataRef("sim/flightmodel/position/local_z")
     dr.hpsi = find("sim/graphics/view/pilots_head_psi")
     dr.hthe = find("sim/graphics/view/pilots_head_the")
     dr.hphi = find("sim/graphics/view/pilots_head_phi")
@@ -677,18 +793,27 @@ function P.update()
         if cam.ok and not active then
             for _, s in ipairs(slots) do
                 if s.on and slot_visible(s) then
-                    -- the click regions' box corners: the window rect and the outline
+                    -- the click regions' box corners: the window rect and the outline.
+                    -- A unit with a corner behind the camera is left out; it must not
+                    -- hide the other unit's window.
                     local pts = {}
+                    local sl, sr, sb, st = nil, nil, nil, nil
                     for _, v in ipairs(g.corners) do
                         local x, y = project(to_cg(s, v))
-                        if not x then l, pts = nil, nil; break end
-                        l = l and math.min(l, x) or x
-                        r = r and math.max(r, x) or x
-                        b = b and math.min(b, y) or y
-                        t = t and math.max(t, y) or y
+                        if not x then pts = nil; break end
+                        sl = sl and math.min(sl, x) or x
+                        sr = sr and math.max(sr, x) or x
+                        sb = sb and math.min(sb, y) or y
+                        st = st and math.max(st, y) or y
                         pts[#pts + 1] = { x, y }
                     end
-                    if pts then outlines[#outlines + 1] = pts end
+                    if pts then
+                        outlines[#outlines + 1] = pts
+                        l = l and math.min(l, sl) or sl
+                        r = r and math.max(r, sr) or sr
+                        b = b and math.min(b, sb) or sb
+                        t = t and math.max(t, st) or st
+                    end
                 end
             end
             -- the outline only matters with the mouse inside the window
