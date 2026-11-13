@@ -3,7 +3,7 @@
 *****************************************************************************************
 * Program Script Name : Garmin G5 (2026, XPLM 4 Panel Graphics)
 *
-* Author Name         : Eric Xu / erix@x-plane.com
+* Author Name         : Eric Xu
 *
 * Drawn directly into an ATTR_cockpit_device screen ("laminar_g5") with the
 * XPLMPanelGraphics API. Replaces the 2024-2025 Plane Maker generic-instrument
@@ -17,14 +17,15 @@
 *   g5_hsi.lua      HSI page         g5_ui.lua      menus, popups, dialogs
 *   g5_fail.lua     validity, failures, alignment, system messages
 *   g5_config.lua   configuration mode (pages, calibrations)
+*   g5_esp.lua      ESP display side: reads the laminar/afcs/ port (AFCS_ESP)
 *   g5_assets.lua   PNG manifest     Textures/      1:1 artwork from the old G5
 *   g5_rfont_data.lua  raster font metrics (generated; glyphs in Textures/RFont)
-*   settings.ini    user settings: power, page, units (GI-260 style)
+*   settings.ini    user settings: power, page, units
 *   config.ini      per-aircraft settings
 *   state_unit<n>.ini  written by the plugin: battery state and the values
 *                   changed in configuration mode (override the two above)
 *****************************************************************************************
-*        COPYRIGHT @ 2024-2026 ERIC XU / Laminar Research - ALL RIGHTS RESERVED
+*        Copyright (c) 2024-2026 Eric Xu / Laminar Research. MIT License, see LICENSE.
 *****************************************************************************************
 --]]
 
@@ -53,23 +54,23 @@ local config = {
     power_lost_countdown_s = 45,
     auto_power_off = "on_ground",
     power_off_hold_s = 5,
-    boot_logo_s = 1.0,
+    boot_logo_s = 2.0,
     shutdown_fade_s = 0.4,
     magnetometer_on_bus = 1,
 
     -- power-up / AHRS (g5_fail.lua)
     att_kwl_s = 0,
     att_kwl_recover_s = 10,
-    align_s = 40,
-    air_init_s = 3,
-    hdg_init_s = 5,
+    align_s = 11,
+    air_init_s = 0,
+    hdg_init_s = 0,
     gps_init_s = 20,
     magnetometer = 1,
     gps_internal = 1,
     gps_external = 1,
     nav_interface = "arinc",
     nav_count = 2,
-    gpss_menu = 1,
+    gpss_menu = 0,      -- derived from ap_option (not a config.ini key any more)
     hsi_page = 1,
     unusual_revert = 1,
     show_wind = 1,
@@ -81,6 +82,8 @@ local config = {
     ext_fail_oat = "rel_g_oat",
     ext_fail_ahrs = "",
     ext_fail_airdata = "",
+    ext_fail_gps_rx = "",
+    ext_fail_mag_degraded = "",
 
     -- battery (g5_system.lua)
     battery_installed = 1,
@@ -109,6 +112,18 @@ local config = {
     backlight_initial = 0.78,
     backlight_auto_initial = 1,
     backlight_min = 0.05,
+    -- configuration mode Backlight page (Installation Manual 5.x tables,
+    -- "Default"): Maximum Display Brightness caps the level (Auto and the
+    -- knob); Filter Time Constant smooths the photocell in Auto, s (0 = none)
+    backlight_max = 1.0,
+    backlight_filter_s = 0,
+    -- Minimum / Maximum Photocell Input ("Default" in the Installation Manual
+    -- tables): the two ends of the Auto curve on the photocell axis, in % of the
+    -- photocell reading (100 x the ambient level ^ 0.25, about 39 % at night,
+    -- 100 % in daylight). 0 / 100 = today's curve (backlight_neutral at the
+    -- bottom, 100 % at the top); g5_system.lua Sys.auto_level
+    photocell_min = 0,
+    photocell_max = 100,
     backlight_neutral = 0.78,
     backlight_doubling = 0.2,
     ambient_min = 0.002,
@@ -116,13 +131,17 @@ local config = {
 
     speed_unit = 0,
     temp_unit = 0,
-    baro_unit = 0,
-    vx = 30,
-    vy = 50,
-    va = 60,
-    vg = 40,
-    -- configuration mode Airspeed page (knots): band limits 0 = from the
-    -- aircraft (acf); VR / VMC / VYSE 0 = not shown
+    baro_unit = 0,      -- 0 inHg, 1 hPa, 2 mb (settings.ini / configuration mode Units page)
+    -- configuration mode Units page (Installation Manual 6.3.6): altitude
+    -- 0 feet, 1 meters; vertical speed 0 ft/min, 1 m/s
+    alt_unit = 0,
+    vs_unit = 0,
+    -- configuration mode Airspeed page (knots): 0 = the aircraft's own (acf);
+    -- VR 0 = not shown (no .acf value)
+    vx = 0,
+    vy = 0,
+    va = 0,
+    vg = 0,
     vne = 0,
     vno = 0,
     vso = 0,
@@ -135,18 +154,43 @@ local config = {
     pitch_cal = 0,
     roll_cal = 0,
     nav_data = 1,
+    -- Selected Course (Installation Manual 5.x Navigation page, note "Select
+    -- Disabled if mechanical CDI or HSI is connected to the navigator,
+    -- otherwise Enabled"): 1 = the G5 sets the course (Course / OBS menu item,
+    -- writes hsi_obs), 0 = it does not
+    selected_course = 1,
+    -- VNAV Deviation Scale (Installation Manual 5.3.1 note 5): the full-scale
+    -- vertical deviation of the VNAV chevron, ft, at the outer dot: 500 | 1000
+    vnav_dev_scale = 500,
     vib_limit_g = 0.3,
+
+    -- Autopilot option: esp (ESP from a Garmin autopilot, Pilot's Guide 3.5;
+    -- the ESP itself is the AFCS_ESP provider's, g5_esp.lua) | gpss (GPS
+    -- steering for an analog autopilot, 4.1) | none. A real G5 never has both:
+    -- ESP needs a Garmin autopilot and the GPSS item is never shown with one.
+    ap_option = "esp",
+    esp = 0,            -- derived from ap_option
     speed_tape_min = 30,
+    speed_tape_floor = 20,
     speed_alive_hyst = 2,
     speed_tape_range = 60,
     speed_trend_s = 6,
     pitch_px_per_deg = 3.6,
+    -- configuration mode Attitude page "Pitch Display": normal (3.6 px / deg,
+    -- "10" labels) | expanded (our name for the second option of Pilot's
+    -- Guide figures 2-5 / 2-6: about 7.4 px / deg, "5" / "10" labels)
+    pitch_display = "normal",
     vsi_scale = 15,
 
     show_tas = 1,
     show_oat = 1,
     show_gs = 1,
     show_hdg_box = 0,
+    -- Heading Bug Auto Sync Mode (Pilot's Guide Rev M 3.3.5.2.1, "if
+    -- configured"; the manuals do not say where the real unit configures it,
+    -- so: this key and a row on the configuration page Flight Controls).
+    -- 0 = off: the Heading menu and the knob hold behave as before
+    hdg_sync = 0,
     show_ap_bar = 1,
     ap_bar_reserved = 1,
     afcs_pft_s = 5,
@@ -156,11 +200,16 @@ local config = {
 
     bearing1_source = 0,
     bearing2_source = 0,
+    -- pilot settings changed on the unit are written back here (save_setting):
+    -- HSI Setup (Wind Vector, HSI Size) and the PFD menu Pitch offset
+    wind_vector = "speed_dir",   -- off | speed_dir | head_xwind
+    hsi_size = "normal",         -- normal | expanded
+    pitch_offset = 0,            -- deg, attitude display offset (PFD menu "Pitch")
 
     screen_scale = 1,
     -- 3D device framebuffer = the whole 2048x1024 G5 texture, 1:1 to its pixels;
     -- the 320x240 screen UV island is at px x 1032..1352, y 8..248 from the top
-    -- (tools/blender/uv_screen_1to1.py), i.e. this origin (y up)
+    -- (the screen UV island of the G5 model), i.e. this origin (y up)
     screen_fb_w = 2048,
     screen_fb_h = 1024,
     screen_origin_x = 1032,
@@ -179,8 +228,14 @@ local config = {
     pick_pass_misses = 0,
     pick_debug = 0,
 
-    -- number of G5 units: 1 = attitude only (G5.obj), 2 = + HSI below (G5_2.obj)
-    units = 1,
+    -- number of G5 units: auto = the G5.obj / G5_2.obj attached in the .acf;
+    -- 1 = attitude only (G5.obj), 2 = + HSI below (G5_2.obj)
+    units = "auto",
+    -- 0 = master, 1 = slave (per unit: unit<n>_role; unit 2 is a slave)
+    role = 0,
+    -- GFC 500 installed: auto = what GFC500.System writes into
+    -- laminar/gfc500/installed; 0 / 1 = fixed
+    gfc500 = "auto",
     -- per-unit values, set from settings.ini (unit_config picks unit<n>_<key>)
     unit2_startup_page = 2,
     unit2_auto_power_on = 1,
@@ -190,8 +245,9 @@ local config = {
 -- installation tables give unit 2 its own bus, battery, GPS and backlight
 -- settings). "" = not set: the shared value is used.
 local PER_UNIT = { "power_bus", "battery_installed", "show_battery", "auto_power_off",
-    "gps_internal", "backlight_auto_initial", "backlight_initial", "battery_wh",
-    "battery_health", "battery_initial_pct", "unusual_revert", "hsi_page" }
+    "gps_internal", "backlight_auto_initial", "backlight_initial", "backlight_max",
+    "backlight_filter_s", "photocell_min", "photocell_max", "battery_wh",
+    "battery_health", "battery_initial_pct", "unusual_revert", "hsi_page", "role" }
 for _, k in ipairs(PER_UNIT) do
     for n = 1, 2 do
         if config["unit" .. n .. "_" .. k] == nil then config["unit" .. n .. "_" .. k] = "" end
@@ -200,6 +256,11 @@ end
 -- real dual installations disable unit 2's own GPS receiver: it gets GPS
 -- from unit 1 over CAN (Installation Manual dual tables)
 config.unit2_gps_internal = "0"
+-- the second unit (the HSI) is a slave of the attitude unit
+config.unit2_role = "1"
+-- Automatic Declutter (back to the PFD in an unusual attitude): enabled on the
+-- attitude unit, disabled on the HSI unit (Installation Manual dual tables)
+config.unit2_unusual_revert = "0"
 
 -- settings.ini: the user-facing settings (power, page, units). Strings as
 -- typed; apply_settings() turns them into the config values above.
@@ -218,7 +279,9 @@ local settings = {
 local POWER = { on = 1, off = 0, ["1"] = 1, ["0"] = 0, yes = 1, no = 0, ["true"] = 1, ["false"] = 0 }
 local PAGE = { ai = 1, pfd = 1, attitude = 1, ["1"] = 1, hsi = 2, ["2"] = 2 }
 local SPEED = { kt = 0, kts = 0, knots = 0, mph = 1, kmh = 2, ["km/h"] = 2, kph = 2 }
-local BARO = { inhg = 0, hpa = 1, mb = 1 }
+-- mb = hPa in value, but labelled "mb" (Pilot's Guide 2.1.3.1); until
+-- 2026-10-29 "mb" gave hPa
+local BARO = { inhg = 0, hpa = 1, mb = 2 }
 local TEMP = { f = 0, c = 1 }
 local PRESETS = {
     imperial = { speed_unit = 0, baro_unit = 0, temp_unit = 0 },
@@ -231,6 +294,8 @@ local PRESETS = {
 -----------------------------------------------------------------------------
 
 local script_dir = ""
+
+local units
 local aircraft_dir = ""
 
 local function normalize(p) return (p or ""):gsub("\\", "/") end
@@ -281,6 +346,7 @@ A.RFONT   = load_module("g5_rfont_data")
 local U   = load_module("g5_util")
 local G   = load_module("g5_gfx")
 local Sim = load_module("g5_sim")
+local Esp = load_module("g5_esp")
 
 -- per-unit modules: every call runs the file again, so each unit gets its own
 -- module state (require would hand back the cached first instance)
@@ -299,20 +365,33 @@ local D = Sim.D
 -- Runtime handles
 -----------------------------------------------------------------------------
 
-local units = {}
+units = {}
 local flight_loop = nil
 local heartbeat = 0
 local gfc_installed = 0
-local last_error = nil
-local error_count = 0
+local error_seen = {}     -- message -> how often it came up
+local error_keys = 0      -- distinct messages in error_seen
+local ERROR_KEYS_MAX = 200
 local global_dr = {}
 
+-- Each distinct message is logged once, then every 600th repeat (two errors
+-- that alternate every frame must not flood Log.txt). A message with a
+-- changing number in it is a new key every frame: the table starts over at
+-- ERROR_KEYS_MAX keys so it cannot grow for the whole session.
 local function report_error(where, err)
-    error_count = error_count + 1
     local msg = where .. ": " .. tostring(err)
-    if msg ~= last_error or error_count % 600 == 0 then
-        log("ERROR " .. msg)
-        last_error = msg
+    local n = error_seen[msg]
+    if n == nil then
+        if error_keys >= ERROR_KEYS_MAX then
+            error_seen, error_keys = {}, 0
+        end
+        error_keys = error_keys + 1
+        n = 0
+    end
+    n = n + 1
+    error_seen[msg] = n
+    if n == 1 or n % 600 == 0 then
+        log("ERROR " .. msg .. (n > 1 and (" (x" .. n .. ")") or ""))
     end
 end
 
@@ -380,6 +459,7 @@ local function load_state(u)
 end
 
 local function save_state(u)
+    if u.cfg.installed == 0 then return end     -- not in the aircraft: no state file
     local out = {
         { "batt_pct", string.format("%.2f", u.st.batt_pct or 0) },
         { "batt_temp", string.format("%.1f", u.st.batt_temp or 20) },
@@ -422,6 +502,86 @@ local function apply_settings()
         config.unit2_startup_page, config.speed_unit, config.baro_unit, config.temp_unit))
 end
 
+-- Which G5s this aircraft has (units = auto): the .acf attachments of
+-- G5.obj (unit 1) and G5_2.obj (unit 2), the same records g5_pick.lua reads.
+-- A unit whose object is not attached is created but never powers up, so a
+-- lone G5_2.obj still works (it takes over as master). units = 1 / 2 in
+-- config.ini skips the scan.
+local function acf_path()
+    local model = XPLMGetNthAircraftModel(0)
+    local acf = type(model) == "table" and U.unwrap_string(model.outPath or model[2]) or tostring(model or "")
+    return U.normalize_path(acf)
+end
+
+local function detect_units()
+    local want = string.lower(tostring(config.units))
+    if want == "1" or want == "2" then
+        local n = tonumber(want)
+        return n, { true, true }
+    end
+    local f = io.open(acf_path(), "r")
+    if not f then
+        log("units = auto: cannot read the .acf, assuming one unit")
+        return 1, { true, false }
+    end
+    local found = { false, false }
+    for line in f:lines() do
+        local file = line:match("^P _obja/%d+/_v10_att_file_stl (.-)%s*$")
+        if file then
+            local base = string.lower(file:gsub("\\", "/"):match("([^/]*)$") or "")
+            if base == "g5.obj" then found[1] = true end
+            if base == "g5_2.obj" then found[2] = true end
+        end
+    end
+    f:close()
+    local n = found[2] and 2 or 1
+    if not found[1] and not found[2] then
+        log("units = auto: no G5.obj / G5_2.obj attached in the .acf, assuming one unit")
+        found[1] = true
+    end
+    log(string.format("units = auto: G5.obj %s, G5_2.obj %s -> %d unit(s)",
+        found[1] and "attached" or "not attached", found[2] and "attached" or "not attached", n))
+    return n, found
+end
+
+-- V-speed references that X-Plane has no dataref for (Plane Maker writes
+-- them only into the .acf): D.vx / vy / va / vg, knots, 0 = not in the file.
+-- configuration mode values (> 0) override them; g5_pfd.lua drops a marker
+-- whose value is out of range.
+local ACF_VSPEEDS = { vx = "_Vx_kts", vy = "_Vy_kts", va = "_Va_kts", vg = "_Vbg_kts" }
+
+local function read_acf_vspeeds()
+    local by_name = {}
+    for key, name in pairs(ACF_VSPEEDS) do
+        D[key] = 0
+        by_name[name] = key
+    end
+    local f = io.open(acf_path(), "r")
+    if not f then
+        log("V-speeds: cannot read the .acf, Vx / Vy / Va / Vg not shown")
+        return
+    end
+    for line in f:lines() do
+        local name, v = line:match("^P acf/(_V%w+_kts) (%S+)")
+        if name and by_name[name] then D[by_name[name]] = tonumber(v) or 0 end
+    end
+    f:close()
+    log(string.format("V-speeds (.acf, kt): Vx %g, Vy %g, Va %g, Vg %g", D.vx, D.vy, D.va, D.vg))
+end
+
+-- A pilot setting changed on the unit (PFD menu Pitch, HSI Setup): applied to
+-- every unit and written to config.ini, so it is there at the next load. Only
+-- that key's line is rewritten (U.ini_set); the rest of the file is kept.
+local function save_setting(key, value)
+    config[key] = value
+    for _, u in ipairs(units or {}) do u.cfg[key] = value end
+    local txt = (type(value) == "number") and string.format("%g", value) or tostring(value)
+    local ok, err = pcall(U.ini_set, script_dir .. "/config.ini", key, txt)
+    if not ok or err == false then
+        log("config.ini: could not save " .. key .. " = " .. txt .. " (" .. tostring(err) .. ")")
+    end
+end
+
 local function make_unit(n)
     local sfx = (n == 1) and "" or ("_" .. n)
     local u = {
@@ -449,9 +609,18 @@ local function make_unit(n)
     u.Hsi.init(U, G, u.Sys, u.Pfd, u.cfg)
     u.UI.init(U, G, u.Sys, u.In, u.Pfd, u.cfg, u.Fail)
     u.Hsi.brg_name = u.UI.brg_name
+    -- no other G5 installed (HSI-only installation test, Installation Manual 6.3.9)
+    u.Hsi.sole_unit = function()
+        for _, o in ipairs(units) do
+            if o ~= u and (o.cfg.installed or 1) ~= 0 then return false end
+        end
+        return true
+    end
     u.Pick.init(U, u.cfg)
     u.Cfg.init(U, G, u.Sys, u.Fail, u.Pfd, u.cfg)
     u.In.Cfg = u.Cfg
+    u.In.Esp, u.Pfd.Esp, u.UI.Esp = Esp, Esp, Esp
+    u.In.save_setting = save_setting
     u.Cfg.hooks = {
         n = n,
         n_units = function() return #units end,
@@ -480,6 +649,110 @@ local function make_unit(n)
     u.Sys.reset()
     u.Fail.reset()
     return u
+end
+
+-----------------------------------------------------------------------------
+-- Software version mismatch (Pilot's Guide table 1-2, AFMS 7-2: "Cross fill
+-- of baro, heading and altitude bugs is disabled"). All units read and write
+-- one set of sim datarefs, so cross-fill is normally implicit. While the
+-- mismatch is on (link_units, cross_fill), the acting master keeps the sim
+-- datarefs (the autopilot and X-Plane's altimeter follow them) and every
+-- other unit has private copies, u.priv = { baro, hdg_bug, alt_bug }, taken
+-- when the mismatch starts. g5_input writes a unit's knob edits there
+-- (In.priv); view_begin / view_end put them into the shared D around the
+-- unit's update, drawing and commands, with its altitude corrected for its
+-- own baro. When the mismatch clears the copies are dropped and the unit
+-- shows the sim's (the master's) values again.
+-----------------------------------------------------------------------------
+
+local FT_PER_INHG = 1000     -- altimeter: ~1000 ft per inHg near sea level
+
+-- the unit's view of D; returns what to give back to view_end (nil: none)
+local function view_begin(u)
+    local p = u.priv
+    if p == nil then return nil end
+    local saved = { D.baro, D.hdg_bug, D.alt_bug, D.alt }
+    D.alt = D.alt + (p.baro - D.baro) * FT_PER_INHG
+    D.baro, D.hdg_bug, D.alt_bug = p.baro, p.hdg_bug, p.alt_bug
+    return saved
+end
+
+local function view_end(saved)
+    if saved then D.baro, D.hdg_bug, D.alt_bug, D.alt = saved[1], saved[2], saved[3], saved[4] end
+end
+
+-----------------------------------------------------------------------------
+-- VFR CDI scale (Pilot's Guide p.23 table 2-1: "VFR" with 0.25 / 1.25 /
+-- 5.00 nm; p.26: with a GPS the CDI full scale is the GPS's distance). The
+-- guide does not say when which applies; our rule follows X-Plane's current
+-- GPS scale: X-Plane full scale (gps_hdef_nm_per_dot x 2.5 dots) up to
+-- 0.5 nm -> 0.25 nm, up to 1.5 nm -> 1.25 nm, above -> 5.00 nm. The full
+-- scale is the main test rather than gps_cdi_sensitivity because in the
+-- the C172 X-Plane's CDI phase stays TERM on the final while the navigator's
+-- nm per dot shrinks; without nm per dot the phase decides (OCN / ENR 5.00,
+-- TERM / DPRT / MAPR 1.25, approach phases 0.25). A phase change jumps to the
+-- new scale (no smoothing, our rule). The cross-track distance is
+-- |hdef| x nm per dot; with X-Plane's needle at its stop a non-zero gps_xtk
+-- is taken if it is larger (en route the VFR full scale is wider than
+-- X-Plane's), but not while a plugin drives the GPS CDI (override_gps:
+-- nothing writes gps_xtk then). X-Plane 12.4 always reports gps_xtk as 0.0
+-- (never nil), which counts as not available: the fallback is the distance
+-- to the waypoint x sin(bearing - desired track). The sign is hdef's.
+-- Returns the deflection in dots for the draw, or nil when no distance can
+-- be had (left unscaled).
+-----------------------------------------------------------------------------
+
+local VFR = {
+    FS_APR = 0.25, FS_TERM = 1.25, FS_ENR = 5.00,   -- nm (Pilot's Guide table 2-1)
+    -- X-Plane full scale (nm) at which the next VFR scale takes over (our
+    -- rule; measured in X-Plane 12.4.4: terminal 1.0 nm, en route 2.0 nm,
+    -- approach 0.3 nm full scale)
+    XP_FS_APR = 0.99, XP_FS_TERM = 1.5,
+    -- |hdef| from which X-Plane's needle counts as at its stop, so gps_xtk
+    -- may say more (full scale 2.5 dots; measured in X-Plane 12.4.4: hdef
+    -- stops at 2.5 dots and gps_xtk stays 0)
+    XP_PEG_DOTS = 2.49,
+    logged = false,
+}
+
+local function vfr_dots(D)
+    local npd = D.gps_nm_dot or 0
+    local fs
+    if npd > 0 then
+        local fs_xp = npd * 2.5
+        fs = (fs_xp <= VFR.XP_FS_APR and VFR.FS_APR) or (fs_xp <= VFR.XP_FS_TERM and VFR.FS_TERM) or VFR.FS_ENR
+    else
+        local c = D.gps_cdi or 1
+        fs = (c <= 1 and VFR.FS_ENR) or (c <= 4 and VFR.FS_TERM) or VFR.FS_APR
+    end
+    local hdef = D.hsi_hdef
+    -- gps_xtk is 0.0, not nil, in X-Plane 12.4: zero means not available
+    local xtk_ok = D.gps_xtk ~= nil and D.override_gps == 0 and math.abs(D.gps_xtk) > 1e-6
+    local xtk
+    if npd > 0 then
+        xtk = math.abs(hdef) * npd
+        if math.abs(hdef) >= VFR.XP_PEG_DOTS then
+            -- X-Plane's needle is at its stop: gps_xtk if it says anything,
+            -- else (it stays 0 in X-Plane 12.4) the distance to the active
+            -- waypoint x sin(bearing to it - desired track); magnitude only,
+            -- the sign is hdef's and U.angdiff handles the 360 wrap
+            local x = xtk_ok and math.abs(D.gps_xtk) or 0
+            if x < 1e-6 and D.override_gps == 0 and D.gps_dme > 0 then
+                x = D.gps_dme * math.abs(math.sin(math.rad(U.angdiff(D.gps_brg, D.gps_dtk))))
+            end
+            xtk = math.max(xtk, x)
+        end
+    elseif xtk_ok then
+        xtk = math.abs(D.gps_xtk)
+    else
+        if not VFR.logged then
+            VFR.logged = true
+            log("VFR CDI scale: no gps_hdef_nm_per_dot and no usable gps_xtk, the deflection stays X-Plane's")
+        end
+        return nil
+    end
+    local sign = (hdef > 0 and 1) or (hdef < 0 and -1) or 0
+    return sign * xtk / fs * 2.5
 end
 
 -----------------------------------------------------------------------------
@@ -524,19 +797,46 @@ local function draw_screen(u, ref)
         u.UI.draw(D, st)
     elseif st.mode == Sys.PFD or st.mode == Sys.HSI then
         -- this unit's view of the shared snapshot: its pitch / roll
-        -- calibration, no CDI / VDI with Navigation Data disabled
-        local p, r, sh, sv = D.pitch, D.roll, D.hsi_show_h, D.hsi_show_v
+        -- calibration, no CDI / VDI with Navigation Data disabled, no GPS
+        -- navigation at all once neither ARINC 429 (GAD 29) nor RS-232 GPS
+        -- data come in (Maintenance Manual 5.1.7.1: a source
+        -- that is installed but sends nothing is removed): no course needle,
+        -- DTK, DIST or GPS bearing pointer. Its own baro and bugs while
+        -- cross-fill is off (view_begin)
+        local p, r = D.pitch, D.roll
+        local gdme, ghas, hdme, hhas = D.gps_dme, D.gps_has_dme, D.hsi_dme, D.hsi_has_dme
         D.pitch, D.roll = p + cfg.pitch_cal, r + cfg.roll_cal
-        if cfg.nav_data == 0 then D.hsi_show_h, D.hsi_show_v = 0, 0 end
+        -- (the same rule masks the mode flashes in Pfd.update)
+        local sh, sv, ng = u.Pfd.mask_nav(D, st)
+        -- VFR (no ARINC 429 GPS data, g5_fail): the GPS CDI on the VFR
+        -- scale, for the draw only (no dataref is written: the autopilot
+        -- keeps X-Plane's deviation)
+        local hdef = D.hsi_hdef
+        if st.gps_vfr and D.hsi_src == 2 and D.hsi_show_h ~= 0 then
+            -- protected: an error must not leave the masked state unrestored
+            local okv, dots = pcall(vfr_dots, D)
+            D.hsi_hdef = (okv and dots) or hdef
+        end
+        if st.gps_nav_lost then
+            D.gps_removed = true
+            D.gps_dme, D.gps_has_dme = 0, 0
+            if D.hsi_src == 2 then D.hsi_dme, D.hsi_has_dme = 0, 0 end
+        end
+        local view = view_begin(u)
         local ok, err
         if st.mode == Sys.PFD then
             ok, err = pcall(u.Pfd.draw, D, st, gfc_installed ~= 0)
         else
             ok, err = pcall(u.Hsi.draw, D, st)
         end
-        D.pitch, D.roll, D.hsi_show_h, D.hsi_show_v = p, r, sh, sv
+        D.pitch, D.roll, D.hsi_hdef = p, r, hdef
+        u.Pfd.unmask_nav(D, sh, sv, ng)
+        D.gps_dme, D.gps_has_dme, D.hsi_dme, D.hsi_has_dme = gdme, ghas, hdme, hhas
+        D.gps_removed = nil
+        -- menus and popups in the same view (Select Heading / Altitude)
+        if ok then ok, err = pcall(u.UI.draw, D, st) end
+        view_end(view)
         if not ok then error(err, 0) end
-        u.UI.draw(D, st)
     end
 
     -- LCD column structure: thin dark lines over the emitted image, so they
@@ -628,33 +928,34 @@ local COMMAND_LIST = {
 }
 
 local function create_commands(u)
-    for _, name in ipairs(u.Fail.INTERNAL) do
-        local key = "fail_" .. name .. "_toggle"
-        u.commands[key] = XPLMCreateCommand(u.prefix .. key, u.name .. " toggle internal fault: " .. name)
-        u.handlers[key] = function(cmd, phase, ref)
-            if phase == BEGIN then u.st.fail[name] = not u.st.fail[name] end
-            return true
-        end
-    end
     for _, c in ipairs(COMMAND_LIST) do
-        local fn = c[3]
-        u.commands[c[1]] = XPLMCreateCommand(u.prefix .. c[1], u.name .. " " .. c[2])
-        u.handlers[c[1]] = function(cmd, phase, ref)
-            fn(u, phase)
-            return true
+        if c[4] ~= "unit1" or u.n == 1 then
+            local fn = c[3]
+            u.commands[c[1]] = XPLMCreateCommand(u.prefix .. c[1], u.name .. " " .. c[2])
+            u.handlers[c[1]] = function(cmd, phase, ref)
+                -- knob edits start from the unit's own values (view_begin)
+                local view = view_begin(u)
+                local ok, err = pcall(fn, u, phase)
+                view_end(view)
+                if not ok then error(err, 0) end
+                return true
+            end
         end
     end
 end
 
+-- through U.reg_cmd: one shared xLua callback, the refcon picks the handler
 local function register_handlers(u)
+    u.cmd_ids = u.cmd_ids or {}
     for name, cmd in pairs(u.commands) do
-        XPLMRegisterCommandHandler(cmd, u.handlers[name], true, nil)
+        u.cmd_ids[name] = U.reg_cmd(cmd, u.handlers[name])
     end
 end
 
 local function unregister_handlers(u)
-    for name, cmd in pairs(u.commands) do
-        XPLMUnregisterCommandHandler(cmd, u.handlers[name], true, nil)
+    for name, id in pairs(u.cmd_ids or {}) do
+        U.unreg_cmd(u.commands[name], id)
+        u.cmd_ids[name] = nil
     end
 end
 
@@ -662,14 +963,122 @@ end
 -- Custom datarefs (per unit)
 -----------------------------------------------------------------------------
 
+-- Output datarefs (whitelist): read-only, computed from X-Plane data or the
+-- unit's own state, never written from outside. They live in xLua's own
+-- storage when xLua offers it (U.native_number, created once in
+-- XPluginStart) and are written once per frame (push_outputs), which costs
+-- none of xLua's callback budget; otherwise they get a normal read-only
+-- accessor in XPluginEnable. Everything that takes input (writable) keeps
+-- an accessor. { name, "i" | "f", value(u, st) }
+local OUT_UNIT = {
+    -- bezel push animations (same names as the old G5.System)
+    { "knob_button_status", "i", function(u, st) return st.knob_down and 1 or 0 end },
+    { "power_button_status", "i", function(u, st) return st.pwr_down and 1 or 0 end },
+    { "unit_on", "i", function(u, st) return (st.mode ~= u.Sys.OFF) and 1 or 0 end },
+    { "aligning_mode", "i", function(u, st) return st.aligning and 1 or 0 end },
+    { "heading_fail", "i", function(u, st) return st.heading_fail and 1 or 0 end },
+    { "batt_percentage", "f", function(u, st) return st.batt_pct or 0 end },
+    { "batt_charging", "i", function(u, st) return st.charging and 1 or 0 end },
+    { "batt_temp_c", "f", function(u, st) return st.batt_temp or 0 end },
+    { "batt_minutes", "f", function(u, st) return u.Sys.battery_minutes() end },
+    { "on_battery", "i", function(u, st) return (st.mode ~= u.Sys.OFF and not st.ext_power) and 1 or 0 end },
+    { "bus_amps", "f", function(u, st) return st.bus_amps or 0 end },
+    -- X-Plane's ambient level, the screen ratio sent back, and the knob ring
+    -- glow (ATTR_light_level in G5.obj, same as the screen)
+    { "ambient_brightness", "f", function(u, st) return st.ambient or 0 end },
+    { "screen_brightness", "f", function(u, st) return st.screen_ratio or 0 end },
+    -- knob ring glow (ATTR_light_level on the ring's LIT): the backlight level,
+    -- not the ambient-scaled screen ratio, which falls to ~0.002 at night and
+    -- left the ring dark; 0 while the unit is off
+    { "knob_ring_brightness", "f", function(u, st)
+        if (st.screen_ratio or 0) <= 0 then return 0 end
+        return st.backlight or 0
+    end },
+    { "ap_disc_alert", "i", function(u, st) return u.Pfd.disc_alert(st) end },
+    { "has_message", "i", function(u, st) return st.has_msg and 1 or 0 end },
+    { "popup_visible", "i", function(u, st) return u.popup_visible and 1 or 0 end },
+}
+
+local OUT_GLOBAL = {
+    { "xlua_loaded", "i", function() return 1 end },
+    { "xlua_heartbeat", "i", function() return heartbeat end },
+    { "unit_count", "i", function() return #units end },
+}
+
+-- Writable values where a bad outside write gains nothing and cannot upset
+-- the unit (it is clamped / overwritten): native storage too, polled each
+-- frame for outside writes. { name, value(u, st), apply(u, st, v) }
+local NATIVE_W_UNIT = {
+    { "knob_turn_val", function(u, st) return st.knob_val end,
+        function(u, st, v) st.knob_val = v % 1 end },
+    { "backlight", function(u, st) return st.backlight end,
+        function(u, st, v) st.backlight = U.clamp(v, 0, 1) end },
+    { "brightness_auto", function(u, st) return st.bright_auto and 1 or 0 end,
+        function(u, st, v) st.bright_auto = (v ~= 0) end },
+}
+
+local out_global = {}   -- name -> native handle (nil: accessor)
+local gfc_native = nil  -- laminar/gfc500/installed in xLua storage
+
+-- XPluginStart: native storage for the whitelist, where xLua offers it
+local function create_outputs()
+    for _, d in ipairs(OUT_GLOBAL) do
+        out_global[d[1]] = U.native_number("laminar/g5/" .. d[1])
+    end
+    for _, u in ipairs(units) do
+        u.out = {}
+        for _, d in ipairs(OUT_UNIT) do
+            u.out[d[1]] = U.native_number(u.prefix .. d[1])
+        end
+        u.outw = {}
+        for _, d in ipairs(NATIVE_W_UNIT) do
+            local h = U.native_number_w(u.prefix .. d[1])
+            if h then u.outw[d[1]] = { h = h, last = nil } end
+        end
+    end
+end
+
+local function reg_out(R, name, kind, fn)
+    if kind == "i" then
+        R[#R + 1] = U.reg_int(name, fn)
+    else
+        R[#R + 1] = U.reg_float(name, fn)
+    end
+end
+
+-- every frame: the values of the native outputs
+local function push_outputs()
+    for _, d in ipairs(OUT_GLOBAL) do
+        local h = out_global[d[1]]
+        if h then U.native_set(h, d[3]()) end
+    end
+    for _, u in ipairs(units) do
+        local st = u.st
+        for _, d in ipairs(OUT_UNIT) do
+            local h = u.out[d[1]]
+            if h then U.native_set(h, d[3](u, st)) end
+        end
+        for _, d in ipairs(NATIVE_W_UNIT) do
+            local w = u.outw[d[1]]
+            if w then
+                local cur = U.native_get(w.h)
+                if w.last ~= nil and cur ~= w.last then d[3](u, st, cur) end
+                local v = d[2](u, st)
+                U.native_set(w.h, v)
+                w.last = v
+            end
+        end
+    end
+end
+
 local function register_datarefs(u)
     local R, P, st, Sys = u.drs, u.prefix, u.st, u.Sys
-    -- the unit's own faults (g5_fail.lua): 1 = failed
-    for _, name in ipairs(u.Fail.INTERNAL) do
-        R[#R + 1] = U.reg_int(P .. "fail_" .. name,
-            function() return st.fail[name] and 1 or 0 end,
-            function(ref, v) st.fail[name] = (v ~= 0) end)
-    end
+    -- the unit's own faults (g5_fail.lua): one int array, element i is
+    -- Fail.INTERNAL[i + 1] (index list in config.ini [Failures]), 1 = failed
+    local names = u.Fail.INTERNAL
+    R[#R + 1] = U.reg_int_array(P .. "fail", #names,
+        function(i) return st.fail[names[i + 1]] and 1 or 0 end,
+        function(i, v) st.fail[names[i + 1]] = (v ~= 0) end)
     R[#R + 1] = U.reg_int(P .. "main_mode",
         function() return st.mode end,
         function(ref, v)
@@ -677,68 +1086,47 @@ local function register_datarefs(u)
             elseif v == Sys.BOOT then Sys.start_boot()
             else Sys.set_page(v) end
         end)
-    R[#R + 1] = U.reg_float(P .. "knob_turn_val",
-        function() return st.knob_val end,
-        function(ref, v) st.knob_val = v end)
     R[#R + 1] = U.reg_int(P .. "hsi_bearing_pointer",
         function() return (st.brg[1] ~= 0 or st.brg[2] ~= 0) and 1 or 0 end,
-        function(ref, v) st.brg[1] = (v ~= 0) and 1 or 0 end)
+        function(ref, v)
+            if v ~= 0 then st.brg[1] = 1 else st.brg[1], st.brg[2] = 0, 0 end
+        end)
     R[#R + 1] = U.reg_int(P .. "bearing1_source",
         function() return st.brg[1] end,
         function(ref, v) st.brg[1] = math.floor(v) % 4 end)
     R[#R + 1] = U.reg_int(P .. "bearing2_source",
         function() return st.brg[2] end,
         function(ref, v) st.brg[2] = math.floor(v) % 4 end)
-    -- bezel push animations (same names as the old G5.System)
-    R[#R + 1] = U.reg_int(P .. "knob_button_status",
-        function() return st.knob_down and 1 or 0 end)
-    R[#R + 1] = U.reg_int(P .. "power_button_status",
-        function() return st.pwr_down and 1 or 0 end)
-    R[#R + 1] = U.reg_int(P .. "unit_on",
-        function() return (st.mode ~= Sys.OFF) and 1 or 0 end)
     R[#R + 1] = U.reg_int(P .. "in_config_mode",
         function() return (st.mode == Sys.CONFIG) and 1 or 0 end,
         function(ref, v)
             if v ~= 0 then Sys.enter_config() else Sys.exit_config() end
         end)
-    R[#R + 1] = U.reg_int(P .. "aligning_mode",
-        function() return st.aligning and 1 or 0 end)
-    R[#R + 1] = U.reg_int(P .. "heading_fail",
-        function() return st.heading_fail and 1 or 0 end)
-    R[#R + 1] = U.reg_float(P .. "batt_percentage",
-        function() return st.batt_pct end)
-    R[#R + 1] = U.reg_int(P .. "batt_charging",
-        function() return st.charging and 1 or 0 end)
-    R[#R + 1] = U.reg_float(P .. "batt_temp_c",
-        function() return st.batt_temp or 0 end)
-    R[#R + 1] = U.reg_float(P .. "batt_minutes",
-        function() return Sys.battery_minutes() end)
-    R[#R + 1] = U.reg_int(P .. "on_battery",
-        function() return (st.mode ~= Sys.OFF and not st.ext_power) and 1 or 0 end)
-    R[#R + 1] = U.reg_float(P .. "bus_amps",
-        function() return st.bus_amps or 0 end)
-    R[#R + 1] = U.reg_float(P .. "backlight",
-        function() return st.backlight end,
-        function(ref, v) st.backlight = U.clamp(v, 0, 1) end)
-    -- read-only: X-Plane's ambient level, the screen ratio sent back, and
-    -- the knob ring glow (ATTR_light_level in G5.obj, same as the screen)
-    R[#R + 1] = U.reg_float(P .. "ambient_brightness", function() return st.ambient end)
-    R[#R + 1] = U.reg_float(P .. "screen_brightness", function() return st.screen_ratio end)
-    R[#R + 1] = U.reg_float(P .. "knob_ring_brightness", function() return st.screen_ratio end)
-    R[#R + 1] = U.reg_int(P .. "brightness_auto",
-        function() return st.bright_auto and 1 or 0 end,
-        function(ref, v) st.bright_auto = (v ~= 0) end)
-    R[#R + 1] = U.reg_int(P .. "ap_disc_alert",
-        function() return u.Pfd.disc_alert(st) end)
-    R[#R + 1] = U.reg_int(P .. "has_message",
-        function() return st.has_msg and 1 or 0 end)
-    R[#R + 1] = U.reg_int(P .. "popup_visible",
-        function() return u.popup_visible and 1 or 0 end)
+    -- the polled native values, as accessors when xLua has no storage for them
+    for _, d in ipairs(NATIVE_W_UNIT) do
+        if not (u.outw and u.outw[d[1]]) then
+            local get, apply = d[2], d[3]
+            if d[1] == "brightness_auto" then
+                R[#R + 1] = U.reg_int(P .. d[1], function() return get(u, st) end,
+                    function(ref, v) apply(u, st, v) end)
+            else
+                R[#R + 1] = U.reg_float(P .. d[1], function() return get(u, st) end,
+                    function(ref, v) apply(u, st, v) end)
+            end
+        end
+    end
+    -- whitelisted outputs without native storage
+    for _, d in ipairs(OUT_UNIT) do
+        if not (u.out and u.out[d[1]]) then
+            local fn = d[3]
+            reg_out(R, P .. d[1], d[2], function() return fn(u, st) end)
+        end
+    end
 end
 
 local function unregister_datarefs(R)
     for i = #R, 1, -1 do
-        if R[i] then XPLMUnregisterDataAccessor(R[i]) end
+        if R[i] then U.unreg_dataref(R[i]) end
         R[i] = nil
     end
 end
@@ -765,13 +1153,58 @@ local function sim_step(real_dt)
     return d
 end
 
-local prev_on1 = nil
-local prev_m2 = nil
 local save_t = 0
 
--- Links between the units: GPS position shared over CAN (a unit without its
--- own receiver uses another unit's), and AFMS 3-2: when the attitude unit
--- (#1) powers down, the HSI unit reverts to the attitude page and stays there.
+-- Links between the units:
+--  * GPS position shared over CAN: a unit without its own receiver uses
+--    another unit's.
+--  * Master / slave (config role, 0 = master): the acting master is the
+--    first live unit with role 0; with none (not installed, off, failed,
+--    both configured as slaves) the first live unit takes over. Every other
+--    live unit is a slave: it uses the master's sensor data as its primary
+--    source and its own where the master's item is invalid (g5_fail.lua), so
+--    each unit's failures still show on their own.
+--  * AFMS 3-2: when no configured master is up any more, a unit on the HSI
+--    page reverts to the attitude page; also when it comes up (power-up,
+--    configuration mode exit) with no configured master.
+local acting_master = nil
+local prev_cfg_master_up = nil
+local prev_mode = {}
+
+local function unit_up(u)
+    return u.cfg.installed ~= 0 and (u.st.mode == u.Sys.PFD or u.st.mode == u.Sys.HSI)
+        and not u.st.fail.hardware
+end
+
+-- Cross-fill of baro, heading bug and selected altitude (see view_begin):
+-- off while either installed unit has the sw_mismatch fault and two are
+-- installed; then the message shows on both units (st.mismatch_link,
+-- g5_fail.lua). One unit alone has nothing to cross-fill and no partner to
+-- mismatch with: no message either.
+local function cross_fill(m)
+    local n_inst, mismatch = 0, false
+    for _, u in ipairs(units) do
+        if u.cfg.installed ~= 0 then
+            n_inst = n_inst + 1
+            if u.st.fail.sw_mismatch then mismatch = true end
+        end
+    end
+    mismatch = mismatch and n_inst >= 2
+    for _, u in ipairs(units) do
+        u.st.mismatch_link = mismatch
+        if mismatch and u ~= m then
+            if u.priv == nil then
+                u.priv = { baro = D.baro, hdg_bug = D.hdg_bug, alt_bug = D.alt_bug }
+                log(string.format("software version mismatch: unit %d keeps its own baro and bugs", u.n))
+            end
+        elseif u.priv ~= nil then
+            u.priv = nil
+            log(string.format("unit %d: cross-fill of baro and bugs again", u.n))
+        end
+        u.In.priv = u.priv
+    end
+end
+
 local function link_units()
     for i, u in ipairs(units) do
         local can = false
@@ -782,38 +1215,126 @@ local function link_units()
         end
         u.st.can_gps = can
     end
-    if #units < 2 then return end
-    local u1, u2 = units[1], units[2]
-    local on1 = u1.st.mode ~= u1.Sys.OFF
-    local m2 = u2.st.mode
-    -- unit 1 goes off, or unit 2 starts (power-up, configuration mode exit)
-    -- on the HSI page while unit 1 is off
-    local came_up = prev_m2 ~= nil and prev_m2 ~= u2.Sys.HSI and prev_m2 ~= u2.Sys.PFD
-    if m2 == u2.Sys.HSI and not on1 and (prev_on1 or came_up) then
-        u2.Sys.set_page(u2.Sys.PFD)
-        log("unit 1 off: unit 2 reverts to the PFD")
+
+    local m, cfg_master_up = nil, false
+    for _, u in ipairs(units) do
+        if u.cfg.role == 0 and unit_up(u) then
+            m = m or u
+            cfg_master_up = true
+        end
     end
-    prev_on1 = on1
-    prev_m2 = u2.st.mode
+    local takeover = false
+    if m == nil then
+        for _, u in ipairs(units) do
+            if unit_up(u) then
+                m, takeover = u, true
+                break
+            end
+        end
+    end
+    if m ~= acting_master then
+        if #units < 2 then
+            -- one unit: nothing to report
+        elseif m then
+            log(string.format("unit %d is the master%s", m.n, takeover and " (take-over)" or ""))
+        elseif acting_master then
+            log("no G5 is up: no master")
+        end
+        acting_master = m
+    end
+    for _, u in ipairs(units) do
+        if u == m then
+            u.primary = nil
+            u.st.role_eff = takeover and "takeover" or "master"
+        else
+            u.primary = (m and unit_up(u)) and m.st or nil
+            u.st.role_eff = "slave"
+        end
+    end
+
+    if #units >= 2 then
+        for _, u in ipairs(units) do
+            local pm = prev_mode[u.n]
+            local came_up = pm ~= nil and pm ~= u.Sys.HSI and pm ~= u.Sys.PFD
+            if u.st.mode == u.Sys.HSI and u.cfg.role ~= 0 and not cfg_master_up
+                and (prev_cfg_master_up or came_up) then
+                u.Sys.set_page(u.Sys.PFD)
+                log(string.format("no master up: unit %d reverts to the PFD", u.n))
+            end
+            prev_mode[u.n] = u.st.mode
+        end
+    end
+    prev_cfg_master_up = cfg_master_up
+    cross_fill(m)
 end
+
+local function read_gfc()
+    if config.gfc500 == "1" then
+        gfc_installed = 1
+    elseif config.gfc500 == "0" then
+        gfc_installed = 0
+    elseif gfc_native then
+        gfc_installed = (U.native_get(gfc_native) or 0) ~= 0 and 1 or 0
+    end
+end
+
+local function update_unit(u, sdt, dt)
+    u.In.gfc = gfc_installed ~= 0
+    u.Hsi.gfc = gfc_installed ~= 0
+    u.Sys.update(sdt, D, dt)
+    u.Fail.update(sdt, D, u.primary)
+    u.In.update(dt, D)     -- menus and button holds run in real time
+    u.Pfd.update(sdt, D)
+    -- Heading Bug Auto Sync Mode (g5_input.lua); nothing to do while it is
+    -- off in config and not running
+    if u.cfg.hdg_sync ~= 0 or u.st.hdg_sync then
+        u.In.hdg_sync_update(D, u.Pfd.afcs_modes(D))
+    else
+        u.st.hdg_sync_ok = false
+    end
+    u.Cfg.update(sdt, D)
+    u.Pick.update()
+end
+
+-- tables reused every frame
+local tick_order, tick_bus = {}, {}
 
 local function tick(dt)
     Sim.read()
+    read_gfc()
     local sdt = sim_step(dt)
+    -- NO GP runs on simulator time (stops while paused / in replay)
+    Sim.update_no_gp(D, sdt)
     link_units()
+    -- the master first, so its slaves see this frame's data
+    local order = tick_order
+    for i = #order, 1, -1 do order[i] = nil end
+    if acting_master then order[1] = acting_master end
     for _, u in ipairs(units) do
-        u.In.gfc = gfc_installed ~= 0
-        u.Hsi.gfc = gfc_installed ~= 0
-        u.Sys.update(sdt, D, dt)
-        u.Fail.update(sdt, D)
-        u.In.update(dt, D)     -- menus and button holds run in real time
-        u.Pfd.update(sdt, D)
-        u.Cfg.update(sdt, D)
-        u.Pick.update()
+        if u ~= acting_master then order[#order + 1] = u end
     end
+    for _, u in ipairs(order) do
+        -- the unit's own baro and bugs while cross-fill is off (alerting,
+        -- knob holds)
+        local view = view_begin(u)
+        local ok, err = pcall(update_unit, u, sdt, dt)
+        view_end(view)
+        if not ok then error(err, 0) end
+    end
+    -- the ESP provider needs a valid attitude from a unit showing a page, and
+    -- one that has finished aligning (no ESP during ALIGNING)
+    local att_ok = false
+    for _, u in ipairs(units) do
+        if (u.st.mode == u.Sys.PFD or u.st.mode == u.Sys.HSI) and u.st.valid.att and not u.st.aligning then
+            att_ok = true
+        end
+    end
+    Esp.update(att_ok, D.run_time)
+    push_outputs()
     -- what the units draw from the aircraft buses
     if config.bus_load ~= 0 then
-        local per = {}
+        local per = tick_bus
+        for k in pairs(per) do per[k] = nil end
         for _, u in ipairs(units) do
             local b = u.cfg.power_bus
             per[b] = (per[b] or 0) + (u.st.bus_amps or 0)
@@ -839,16 +1360,41 @@ end
 -- Lifecycle
 -----------------------------------------------------------------------------
 
-function XPluginStart()
-    log("XPluginStart, script dir: " .. script_dir)
+local function start()
     U.read_ini(script_dir .. "/config.ini", config)
     U.read_ini(script_dir .. "/settings.ini", settings)
     apply_settings()
     config.nav_interface = string.lower(tostring(config.nav_interface))
+    if config.nav_interface ~= "arinc" and config.nav_interface ~= "rs232" then
+        log("config.ini: nav_interface = '" .. config.nav_interface .. "' is not valid (arinc | rs232), using arinc")
+        config.nav_interface = "arinc"
+    end
+    -- divisors: a zero or negative value would divide by zero
+    for key, min in pairs({ battery_charge_eff = 0.05, backlight_doubling = 0.01, battery_temp_tau_s = 1 }) do
+        local v = tonumber(config[key])
+        if v == nil or v < min then
+            log("config.ini: " .. key .. " = " .. tostring(config[key]) .. " is too small, using " .. min)
+            config[key] = min
+        end
+    end
     config.auto_power_off = string.lower(tostring(config.auto_power_off))
     config.fd_cue = string.lower(tostring(config.fd_cue))
     config.show_battery = string.lower(tostring(config.show_battery))
     config.roll_pointer = string.lower(tostring(config.roll_pointer))
+    -- ap_option -> the internal esp / gpss_menu switches. The old config.ini
+    -- keys esp / gpss_menu are still read but ap_option decides.
+    local legacy_esp, legacy_gpss = config.esp, config.gpss_menu
+    local opt = string.lower(tostring(config.ap_option))
+    if opt ~= "esp" and opt ~= "gpss" and opt ~= "none" then
+        log("config.ini: ap_option = '" .. tostring(config.ap_option) .. "' is not valid (esp | gpss | none), using esp")
+        opt = "esp"
+    end
+    config.ap_option = opt
+    config.esp = (opt == "esp") and 1 or 0
+    config.gpss_menu = (opt == "gpss") and 1 or 0
+    if legacy_esp ~= 0 or legacy_gpss ~= 0 then
+        log("config.ini: esp / gpss_menu are replaced by ap_option (" .. opt .. ")")
+    end
     -- VSI range: only the two scales there is artwork for
     if config.vsi_scale ~= 15 and config.vsi_scale ~= 30 then
         log("config.ini: vsi_scale = " .. tostring(config.vsi_scale) .. " is not valid (15 | 30), using 15")
@@ -858,23 +1404,61 @@ function XPluginStart()
         log("config.ini: roll_pointer = '" .. config.roll_pointer .. "' is not valid, using ground")
         config.roll_pointer = "ground"
     end
+    config.pitch_display = string.lower(tostring(config.pitch_display))
+    if config.pitch_display ~= "normal" and config.pitch_display ~= "expanded" then
+        log("config.ini: pitch_display = '" .. config.pitch_display .. "' is not valid (normal | expanded), using normal")
+        config.pitch_display = "normal"
+    end
+    if config.vnav_dev_scale ~= 500 and config.vnav_dev_scale ~= 1000 then
+        log("config.ini: vnav_dev_scale = " .. tostring(config.vnav_dev_scale) .. " is not valid (500 | 1000), using 500")
+        config.vnav_dev_scale = 500
+    end
 
     G.set_scale(config.screen_scale)
     G.init_colors()
     G.init_fonts(config.font_bold, config.font_cond)
     G.load_images(U.xp_relative(script_dir), A, log)
     Sim.init(U, config)
+    Esp.init(U, config)
+    read_acf_vspeeds()
 
-    local n_units = math.max(1, math.min(2, math.floor(config.units)))
+    local n_units, installed = detect_units()
     for n = 1, n_units do
         units[n] = make_unit(n)
+        units[n].cfg.installed = installed[n] and 1 or 0
         create_commands(units[n])
     end
     log(string.format("%d unit(s)", n_units))
 
-    gfc_dr = U.reg_int("laminar/gfc500/installed",
-        function() return gfc_installed end,
-        function(ref, v) gfc_installed = v end)
+    -- GFC500.System (xLua 1) finds laminar/gfc500/installed and writes 1 into
+    -- it every frame, so it must exist. In xLua storage it costs no callback;
+    -- gfc500 = 0 / 1 in config.ini fixes the value instead of reading it.
+    config.gfc500 = string.lower(tostring(config.gfc500))
+    gfc_native = U.native_number_w("laminar/gfc500/installed")
+    if gfc_native == nil then
+        gfc_dr = U.reg_int("laminar/gfc500/installed",
+            function() return gfc_installed end,
+            function(ref, v) gfc_installed = v end)
+    end
+    create_outputs()
+    local nn = 0
+    for _ in pairs(out_global) do nn = nn + 1 end
+    for _, u in ipairs(units) do for _ in pairs(u.out) do nn = nn + 1 end end
+    log(string.format("output datarefs in xLua storage: %d (%s)", nn,
+        U.native_ok() and "XLuaCreateDataRef" or "not offered, accessors"))
+end
+
+function XPluginStart()
+    log("XPluginStart, script dir: " .. script_dir)
+    local ok, err = pcall(start)
+    if not ok then
+        log("ERROR XPluginStart failed: " .. tostring(err))
+        if gfc_dr then
+            pcall(U.unreg_dataref, gfc_dr)
+            gfc_dr = nil
+        end
+        return false
+    end
     return true
 end
 
@@ -922,11 +1506,46 @@ local function create_devices(u)
     end
 end
 
-function XPluginEnable()
-    log("XPluginEnable")
-    global_dr[#global_dr + 1] = U.reg_int("laminar/g5/xlua_loaded", function() return 1 end)
-    global_dr[#global_dr + 1] = U.reg_int("laminar/g5/xlua_heartbeat", function() return heartbeat end)
-    global_dr[#global_dr + 1] = U.reg_int("laminar/g5/unit_count", function() return #units end)
+-- the Level command observer (enable): declared before teardown, which undoes it
+local lvl_cmd, lvl_id = nil, nil
+
+-- Everything XPluginEnable sets up, torn down in reverse; safe to run on a
+-- half-finished enable (every handle is stored as soon as it exists).
+local function teardown()
+    if flight_loop then
+        XPLMDestroyFlightLoop(flight_loop)
+        flight_loop = nil
+    end
+    for _, u in ipairs(units) do
+        pcall(u.Pick.disable)
+        if u.popup then
+            XPLMDestroyAvionics(u.popup)
+            u.popup = nil
+        end
+        if u.avionic then
+            XPLMDestroyAvionics(u.avionic)
+            u.avionic = nil
+        end
+        unregister_handlers(u)
+        unregister_datarefs(u.drs)
+    end
+    unregister_datarefs(global_dr)
+    if lvl_cmd and lvl_id then U.unreg_cmd(lvl_cmd, lvl_id) end
+    lvl_cmd, lvl_id = nil, nil
+end
+
+local function enable()
+    -- observe the Level command (display only; passed on unchanged): g5_sim LVL
+    lvl_cmd = U.find_cmd("sim/autopilot/return_to_level")
+    if lvl_cmd then
+        lvl_id = U.reg_cmd(lvl_cmd, function(cmd, phase)
+            if phase == BEGIN then Sim.note_lvl() end
+        end)
+    end
+    -- the whitelisted outputs without native storage
+    for _, d in ipairs(OUT_GLOBAL) do
+        if not out_global[d[1]] then reg_out(global_dr, "laminar/g5/" .. d[1], d[2], d[3]) end
+    end
 
     -- the aircraft's own cockpit object keeps all native clicks; the G5 knob and
     -- button are picked by the plugin (see g5_pick.lua)
@@ -952,34 +1571,33 @@ function XPluginEnable()
     return true
 end
 
+
+-- A failure half-way (e.g. xLua's callback budget running out) must not
+-- leave datarefs or handlers registered: X-Plane would keep calling
+-- closures xLua has already released, which crashed the sim on 2026-10-16.
+-- So undo everything and report the plugin as not enabled.
+function XPluginEnable()
+    log("XPluginEnable")
+    local ok, err = pcall(enable)
+    if not ok then
+        log("ERROR XPluginEnable failed, everything unregistered: " .. tostring(err))
+        pcall(teardown)
+        return false
+    end
+    return true
+end
+
 function XPluginDisable()
     log("XPluginDisable")
     for _, u in ipairs(units) do pcall(save_state, u) end
     for i = 0, 5 do pcall(Sim.set_bus_load, i, 0) end
-    if flight_loop then
-        XPLMDestroyFlightLoop(flight_loop)
-        flight_loop = nil
-    end
-    for _, u in ipairs(units) do
-        pcall(u.Pick.disable)
-        if u.popup then
-            XPLMDestroyAvionics(u.popup)
-            u.popup = nil
-        end
-        if u.avionic then
-            XPLMDestroyAvionics(u.avionic)
-            u.avionic = nil
-        end
-        unregister_handlers(u)
-        unregister_datarefs(u.drs)
-    end
-    unregister_datarefs(global_dr)
+    teardown()
 end
 
 function XPluginStop()
     log("XPluginStop")
     if gfc_dr then
-        XPLMUnregisterDataAccessor(gfc_dr)
+        U.unreg_dataref(gfc_dr)
         gfc_dr = nil
     end
     G.destroy_images()
@@ -989,8 +1607,10 @@ end
 local MSG_PLANE_LOADED = XPLM_MSG_PLANE_LOADED or 102
 local MSG_AIRPORT_LOADED = XPLM_MSG_AIRPORT_LOADED or 103
 
+local PLUGIN_XPLANE = XPLM_PLUGIN_XPLANE or 0
+
 function XPluginReceiveMessage(from, msg, param)
-    if from ~= XPLM_PLUGIN_XPLANE then return end
+    if from ~= PLUGIN_XPLANE then return end
     -- new flight: same reset the old flight_start() did
     if msg == MSG_AIRPORT_LOADED or (msg == MSG_PLANE_LOADED and (param == 0 or param == nil)) then
         for _, u in ipairs(units) do
@@ -998,7 +1618,8 @@ function XPluginReceiveMessage(from, msg, param)
             u.Sys.reset()
             u.Fail.reset()
         end
-        prev_on1 = nil
-        prev_m2 = nil
+        prev_cfg_master_up = nil
+        prev_mode = {}
+        Esp.reset()
     end
 end

@@ -1,5 +1,5 @@
 -- g5_ui.lua: overlays on the 2024-2025 artwork. Menu (Menu_Option_Base +
--- PFD/HSI_Options_5/6 tile strips + PFD_Menu_Selected), popups (Pops_*),
+-- one tile image per item (Tile_*) + PFD_Menu_Selected), popups (Pops_*),
 -- backlight page (Brightness_*), battery (BATT_*), power-off (Shut_Ongoing +
 -- 321) and power-lost (Ext_Power_Lost_UI) dialogs, boot logo.
 -- Positions are the old Plane Maker POS values in screen pixels.
@@ -14,9 +14,17 @@ function UI.init(util, gfx, sys, input, pfd, config, fail)
     C = G.C
 end
 
--- old panels slide up 70 px over 0.3 s
+-- panels slide up 70 px; `anim` is already eased (g5_input.lua slide())
 local function slide(anim)
     return -70 + 70 * anim
+end
+
+-- pressed look of a menu tile: its face turns a lighter grey (video 0:16.6,
+-- Altitude tile; there is no pressed tile art)
+local press_tint
+local function pressed_face(x0, y0, x1, y1)
+    press_tint = press_tint or G.rgba(1, 1, 1, 0.2)
+    G.rect(x0, y0, x1, y1, press_tint)
 end
 
 local TILE_X0, TILE_PITCH = 43, 78   -- tile 1 centre / spacing in the Options strips
@@ -27,22 +35,20 @@ local XB, DISP = 0.59, 0.75
 -- Battery indicator
 -----------------------------------------------------------------------------
 
+-- the same frame (colour) rule as the pages' status box: Pfd.batt_frame
 local function batt_frame(pct)
-    return U.clamp(math.floor(pct / 20.001), 0, 4)
+    return Pfd.batt_frame(pct)
 end
 
 -- (the battery status itself is drawn by the pages: Pfd.battery_box)
-local function page_indicators(D, st)
-end
-
 -----------------------------------------------------------------------------
 -- Menu
 -----------------------------------------------------------------------------
 
--- tile art per item (tools/make_batch_e_art.py); labelled tiles use the
+-- tile art per item; labelled tiles use the
 -- blank tile with the label drawn as text
-local TILE_ART = { back = "Tile_Back", message = "Tile_Message", gpss = "Tile_GPSS",
-    hsi = "Tile_HSI", pfd = "Tile_PFD" }
+local TILE_ART = { back = "Tile_Back", message = "Tile_Message", gpss = "Tile_GPSS", esp = "Tile_BlankBar",
+    hsi = "Tile_HSI", pfd = "Tile_PFD", setup = "Tile_Setup" }
 
 local function tile_label(item, D, st)
     if item == "heading" then
@@ -51,6 +57,8 @@ local function tile_label(item, D, st)
     elseif item == "course" then return (D.hsi_src == 2) and "OBS" or "Course"
     elseif item == "source" then return "Source"
     elseif item == "setup" then return "Setup"
+    elseif item == "pitch" then return "Pitch"
+    elseif item == "esp" then return "ESP"
     end
 end
 
@@ -67,6 +75,8 @@ local function menu(D, st)
         local tx = TILE_X0 + (i - 1 - s) * TILE_PITCH
         if tx > -40 and tx < 360 then
             G.pic(TILE_ART[item] or "Tile_Blank", tx, 39 + off)
+            -- Tile_* are 74 x 49 with a 2 px rim
+            if st.menu_press == i then pressed_face(tx - 35, 16.5 + off, tx + 35, 61.5 + off) end
             local label = tile_label(item, D, st)
             if label then G.rstr_c(fs_label, label, tx, 48.5 + off, C.white) end
         end
@@ -79,31 +89,53 @@ local function menu(D, st)
                 -- current source in its colour; pressing the tile steps it (AFMS 4-4)
                 G.rstr_c(G.rfont("bold", 11), Pfd.nav_label(D), tx, 28 + off,
                     D.hsi_src == 2 and C.magenta or C.green_nav)
-            elseif item == "setup" then
-                if st.brg[1] ~= 0 or st.brg[2] ~= 0 then G.pic("GPSS_ON_Bar", tx, 24.5 + off) end
+            elseif item == "pitch" then
+                -- "+3.3°" cyan (real unit)
+                G.rstr_c(G.rfont("xbold", 11), string.format("%+.1f°", cfg.pitch_offset or 0), tx, 27 + off, C.cyan)
             elseif item == "heading" then
                 -- invalid values show as dashes (Pilot's Guide figure 1-18)
                 if st.valid.hdg_mode == "fail" then
                     G.pic("Cyan_Bars_3_dashes", tx - 8, 28 + off)
+                    G.rstr(G.rfont("bold", 6), "°", tx + 12, 34 + off, C.cyan)
+                elseif st.hdg_sync then
+                    -- Heading Bug Auto Sync Mode: "SYNC" where the value stands
+                    -- (Pilot's Guide Rev M figure 3-19)
+                    -- (a missing raster face gives nil: G.rstr* draw nothing then)
+                    local fs = G.rfont("xbold", 13)
+                    G.rstr_c(fs, "SYNC", tx, 33 + off - (fs and fs.size or 0) / 2, C.cyan)
                 else
-                    G.led("cyan_xb", Pfd.fmt_hdg(D.hdg_bug), tx - 6, 33 + off, XB)
+                    -- "065°": the Altitude tile's digits with a full-size degree
+                    -- sign, centred as one group (Pilot's Guide 1.5.2 figure)
+                    -- magenta for a selected track (ground track mode, or the
+                    -- autopilot in TRK), like the bug: Pfd.bug_kind
+                    local trk = Pfd.bug_kind(D, st) == "trk"
+                    local font, col = trk and "magenta_xb" or "cyan_xb", trk and C.magenta or C.cyan
+                    local str = Pfd.fmt_hdg(D.hdg_bug)
+                    local fs = G.rfont("xbold", 14)
+                    local dw = G.led_w(font, str, XB)
+                    local gw = G.rstr_w(fs, "°")
+                    local dcx = tx - (dw + 1 + gw) / 2 + dw / 2
+                    G.led(font, str, dcx, 33 + off, XB)
+                    G.rstr(fs, "°", dcx + dw / 2 + 1, 33 + off - (fs and fs.size or 0) / 2, col)
                 end
-                G.rstr(G.rfont("bold", 6), "°", tx + 12, 34 + off, C.cyan)
             elseif item == "course" then
-                -- the course takes the source colour (figures 2-29, 2-30)
-                G.led(D.hsi_src == 2 and "magenta" or "green", Pfd.fmt_hdg(D.hsi_obs), tx - 6, 33 + off, XB)
-                G.rstr(G.rfont("bold", 6), "°", tx + 12, 34 + off, D.hsi_src == 2 and C.magenta or C.green_nav)
+                -- the course takes the source colour (figures 2-29, 2-30), in
+                -- the type of the Pitch value, "172°" (real unit, 2026-07-20 video)
+                G.rstr_c(G.rfont("xbold", 11), Pfd.fmt_hdg(D.hsi_obs) .. "°", tx, 27 + off,
+                    D.hsi_src == 2 and C.magenta or C.green_nav)
             elseif item == "altitude" and not st.valid.air then
                 G.pic("Cyan_Bars_5_dashes", tx - 6, 28 + off)
-                G.pic("Menu_Altitude_Units", tx + 26, 32.5 + off, nil, 0)
+                G.pic("Menu_Altitude_Units", tx + 26, 32.5 + off, nil, Pfd.alt_metric() and 1 or 0)
             elseif item == "altitude" then
-                local str = tostring(U.round(D.alt_bug))
+                -- feet or meters (Units page); the art's second cell is the "m"
+                local str = tostring(U.round(Pfd.alt_value(D.alt_bug)))
                 G.led("cyan_xb", str, tx - 6, 33 + off, XB)
-                G.pic("Menu_Altitude_Units", tx - 6 + G.led_w("cyan_xb", str, XB) / 2 + 4, 32.5 + off, nil, 0)
+                G.pic("Menu_Altitude_Units", tx - 6 + G.led_w("cyan_xb", str, XB) / 2 + 4, 32.5 + off, nil,
+                    Pfd.alt_metric() and 1 or 0)
+            elseif item == "esp" then
+                if UI.Esp.enabled then G.pic("GPSS_ON_Bar", tx, 24.5 + off) end
             elseif item == "gpss" then
                 if D.hdg_is_gpss ~= 0 or D.gpss_status == 2 then G.pic("GPSS_ON_Bar", tx, 24.5 + off) end
-            elseif item == "bearing" then
-                if st.brg[1] ~= 0 or st.brg[2] ~= 0 then G.pic("GPSS_ON_Bar", tx, 24.5 + off) end
             end
         end
     end
@@ -132,41 +164,119 @@ local function popup_title(text, off)
     G.rstr_c(G.rfont("bold", 9), text, 160.5, 57 + off, C.white)
 end
 
--- Setup (Pilot's Guide figures 2-18 .. 2-20): Back, Bearing Pointer 1, 2
-local setup_frame, setup_cell
+-- HSI Setup page (real unit, 2026-07-20 photos): a panel over the lower half
+-- with the "Setup" title bar and two rows in view (Back, Bearing Pointer 1,
+-- Bearing Pointer 2, Wind Vector, HSI Size); label left, value button right,
+-- cyan frame on the selected row (Back) or its button; scroll bar right. A
+-- pressed value row shows its list in the middle of the screen instead.
+local SETUP_LABEL = { back = "Back", brg1 = "Bearing Pointer 1", brg2 = "Bearing Pointer 2",
+    wind = "Wind Vector", size = "HSI Size" }
+local OPT_LABEL = { off = "Off", speed_dir = "Speed/Dir", head_xwind = "Head/X-wind",
+    normal = "Normal", expanded = "Expanded" }
+local function opt_label(key, v)
+    if key == "brg1" or key == "brg2" then return brg_name(v) end
+    return OPT_LABEL[v] or tostring(v)
+end
+UI.opt_label = opt_label
+
+local SETUP_TITLE, SETUP_ROW, SETUP_VIS = 18, 38, 2
+local sc = nil
+local function setup_cols()
+    sc = sc or {
+        frame = G.hex("8A8A8A"), row = G.hex("101010"), btn_top = G.hex("5A5A5A"),
+        btn_bot = G.hex("2E2E2E"), btn_edge = G.hex("9A9A9A"), bar = G.hex("D8D8D8"),
+    }
+    return sc
+end
+
+local function value_button(x0, y0, x1, y1, text)
+    local c = setup_cols()
+    local ym = (y0 + y1) / 2
+    G.rect(x0, y0, x1, ym, c.btn_bot)
+    G.rect(x0, ym, x1, y1, c.btn_top)
+    G.box(x0 + 0.5, y0 + 0.5, x1 - 0.5, y1 - 0.5, c.btn_edge, 1)
+    G.rstr_c(G.rfont("bold", 10), text, (x0 + x1) / 2, ym - 5, C.white)
+end
+
 local function setup_popup(st, off)
-    setup_frame = setup_frame or G.hex("808080")
-    setup_cell = setup_cell or G.hex("1A1A1A")
-    local frame = setup_frame
-    local h = 78
-    local y0 = -h + h * st.popup_anim
-    local y1 = y0 + h
-    G.rect(1, y0, 319, y1, C.black)
-    G.box(1, y0, 319, y1, frame, 1)
+    local c = setup_cols()
+    local rows = In.SETUP_ROWS
+    local h = SETUP_TITLE + SETUP_VIS * SETUP_ROW + 4
+    local y1 = -h + h * st.popup_anim + h
+    local y0 = y1 - h
+    G.rect(0, y0, 320, y1, C.black)
     G.pic("Pops_Title_Bar", 160, y1 - 11)
-    G.rstr_c(G.rfont("bold", 9), "Setup", 160, y1 - 10, C.white)
+    G.rstr_c(G.rfont("bold", 9), "Setup", 160, y1 - 13, C.white)
+    -- first row in view keeps the selection visible
+    st.setup_scroll = U.clamp(st.setup_scroll or 0, st.popup_row - SETUP_VIS, st.popup_row - 1)
+    local first = st.setup_scroll
     local fs = G.rfont("bold", 10)
-    local rows = { "Back", "Bearing Pointer 1", "Bearing Pointer 2" }
-    for i = 1, 3 do
-        local yb = y1 - 18 - (i - 1) * 18
-        G.rstr(fs, rows[i], 12, yb - 10, C.white)
-        if i > 1 then
-            local v = brg_name(st.brg[i - 1])
-            G.rect(222, yb - 13, 312, yb - 1, setup_cell)
-            G.rstr_c(fs, v, 267, yb - 10, (st.brg[i - 1] ~= 0) and C.cyan or C.white)
+    for v = 1, SETUP_VIS do
+        local i = first + v
+        local key = rows[i]
+        if key then
+            local top = y1 - SETUP_TITLE - (v - 1) * SETUP_ROW
+            local bot = top - SETUP_ROW + 3
+            G.rect(4, bot, 308, top - 1, c.row)
+            G.box(4.5, bot + 0.5, 307.5, top - 1.5, c.frame, 1)
+            local ym = (top + bot) / 2
+            if key == "back" then
+                -- the blue back arrow (Icon_Back, cut from Tile_Back) at 0.6 x
+                G.pic_k("Icon_Back", 30, ym, 0.6)
+                G.rstr(fs, "Back", 54, ym - 5, C.white)
+                if st.popup_row == i then G.box(4.5, bot + 0.5, 307.5, top - 1.5, C.cyan, 1.5) end
+            else
+                G.rstr(fs, SETUP_LABEL[key], 10, ym - 5, C.white)
+                value_button(178, bot + 4, 302, top - 5, opt_label(key, In.setup_value(key)))
+                if st.popup_row == i then G.box(177.5, bot + 3.5, 302.5, top - 4.5, C.cyan, 1.5) end
+            end
         end
-        if st.popup_row == i then
-            local x0 = (st.setup_edit and i > 1) and 221 or 6
-            local x1 = (st.setup_edit and i > 1) and 313 or 313
-            G.box(x0 + 0.5, yb - 13.5, x1 - 0.5, yb - 0.5, C.cyan, 1)
-        end
+    end
+    -- scroll bar
+    local span_top, span_bot = y1 - SETUP_TITLE - 2, y0 + 3
+    local span = span_top - span_bot
+    local th = span * SETUP_VIS / #rows
+    local ty = span_top - th - (span - th) * first / (#rows - SETUP_VIS)
+    G.rect(311, ty, 314, ty + th, c.bar)
+end
+
+-- the list of a Setup row (real unit, 2026-07-20 video 0:45 / 1:07, measured):
+-- centred, its bottom 9 px above the screen's bottom edge; title bar 22 px,
+-- one framed 26 px entry per value (12 px text), cyan frame on the
+-- highlighted one; as wide as its title / entries need (at least 132 px)
+local LIST_BOTTOM, LIST_TITLE, LIST_ROW = 9, 22, 26
+local list_title_col
+local function setup_list(st)
+    local c = setup_cols()
+    local key = st.setup_drop
+    local opts = In.setup_options(key)
+    local title = SETUP_LABEL[key]
+    local ft, fs = G.rfont("bold", 10), G.rfont("bold", 12)
+    local w = math.max(132, G.rstr_w(ft, title) + 34)
+    for _, v in ipairs(opts) do w = math.max(w, G.rstr_w(fs, opt_label(key, v)) + 40) end
+    w = math.floor(w / 2 + 0.5) * 2
+    local h = LIST_TITLE + #opts * LIST_ROW + 6
+    local x0, x1 = 160 - w / 2, 160 + w / 2
+    local y0 = LIST_BOTTOM
+    local y1 = y0 + h
+    list_title_col = list_title_col or G.hex("3A3A3A")
+    G.rect(x0, y0, x1, y1, C.black)
+    G.box(x0 + 0.5, y0 + 0.5, x1 - 0.5, y1 - 0.5, c.frame, 1)
+    G.rect(x0 + 1, y1 - LIST_TITLE + 1, x1 - 1, y1 - 1, list_title_col)
+    G.rstr_c(ft, title, 160, y1 - LIST_TITLE + 6, C.white)
+    for i, v in ipairs(opts) do
+        local top = y1 - LIST_TITLE - 1 - (i - 1) * LIST_ROW
+        local bot = top - LIST_ROW + 2
+        G.box(x0 + 4.5, bot + 0.5, x1 - 4.5, top - 0.5, c.frame, 1)
+        G.rstr(fs, opt_label(key, v), x0 + 10, (top + bot) / 2 - 6, C.white)
+        if st.drop_sel == i then G.box(x0 + 4, bot, x1 - 4, top, C.cyan, 1.5) end
     end
 end
 
+-- title from the tuned frequency, so "Localizer Course" also with NO LOC
 local function course_popup_key(D)
     if D.hsi_src == 2 then return "Pops_Menu_OBS" end
-    local t = (D.hsi_src == 1) and D.nav2_type or D.nav1_type
-    if t == 4 or t == 5 then return "Pops_Menu_Course" end
+    if Pfd.loc_tuned(D) then return "Pops_Menu_Course" end
     return "Pops_Menu_VOR"
 end
 
@@ -213,17 +323,40 @@ local function popup(D, st)
         -- "Select Heading" / "Select Ground Track" (figures 2-12, 2-13)
         local trk = st.valid.hdg_mode == "trk" or D.hdg_mode == 18
         popup_title(trk and "Select Ground Track" or "Select Heading", off)
-        G.led("cyan", Pfd.fmt_hdg(D.hdg_bug), 154, 26 + off, DISP)
+        if st.hdg_sync then
+            -- Heading Bug Auto Sync Mode: "SYNC" in the window (Rev M 3.3.5.2.1)
+            local fs = G.rfont("xbold", 20)
+            -- the window art has the value's degree sign baked in at the right
+            G.rect(183, 25 + off, 196, 38 + off, C.black)
+            G.rstr_c(fs, "SYNC", 160.5, 26 + off - (fs and fs.size or 0) / 2, C.cyan)
+        else
+            G.led("cyan", Pfd.fmt_hdg(D.hdg_bug), 154, 26 + off, DISP)
+        end
     elseif p == "altitude" then
-        G.pic("Pops_Menu_Altitude", 160.5, 35.5 + off)
-        G.led_field("cyan", tostring(U.round(D.alt_bug)), 5, 152, 26 + off, DISP)
+        -- "Select Altitude", the value and a stacked "ft" centred as one group
+        -- (real unit, 2026-07-20 video 0:18)
+        popup_title("Select Altitude", off)
+        -- the window art has the heading's degree sign baked in at the right (see the SYNC case
+        -- above): it showed between the digits and the unit, or inside the last digit of a
+        -- five-digit value. Covered before the digits and the unit are drawn
+        G.rect(183, 25 + off, 196, 38 + off, C.black)
+        local str = tostring(U.round(Pfd.alt_value(D.alt_bug)))
+        local vw = G.led_w("cyan", str, DISP)
+        local uw = 8
+        local cx = 160.5 - uw / 2
+        G.led("cyan", str, cx, 26 + off, DISP)
+        G.pic("Menu_Altitude_Units", cx + vw / 2 + 2 + uw / 2, 26 + off, nil, Pfd.alt_metric() and 1 or 0)
     elseif p == "course" then
         G.pic(course_popup_key(D), 160.5, 35.5 + off)
         G.led("cyan", Pfd.fmt_hdg(D.hsi_obs), 154, 26 + off, DISP)
     elseif p == "message" then
         message_list(st)
     elseif p == "setup" then
-        setup_popup(st, off)
+        if st.setup_drop then setup_list(st) else setup_popup(st, off) end
+    elseif p == "pitch" then
+        -- "Pitch Offset" +3.3° (video 2026-07-20 2:04)
+        popup_title("Pitch Offset", off)
+        G.rstr_c(G.rfont("bold", 18), string.format("%+.1f°", cfg.pitch_offset or 0), 160.5, 17 + off, C.cyan)
     end
 end
 
@@ -231,26 +364,43 @@ end
 -- Backlight page
 -----------------------------------------------------------------------------
 
+local manual_fill, manual_rest
 local function backlight(st)
     if st.bright_anim <= 0 then return end
     local off = slide(st.bright_anim)
     G.pic("Brightness_Panel_Main", 159.5, 35.5 + off)
-    if st.bright_auto then
+    -- Brightness_Auto_Pressed is the light pressed face of the Auto button:
+    -- shown while the power button is down, in Auto as in Manual (video
+    -- 1:26.3-1:26.4, frames 2591-2593); Auto itself is the dark face with the
+    -- green bar of Brightness_Panel_Auto
+    if st.bright_press then G.pic("Brightness_Auto_Pressed", 34.5, 27.5 + off) end
+    manual_fill = manual_fill or G.hex("26B8BC")
+    manual_rest = manual_rest or G.hex("6A6A6A")
+    if st.bright_auto or st.bright_confirm then
         -- Auto (AFMS 4-2): green wedge filled to the photocell level, green
         -- bar under "Auto". Gradient x 65.5..253.5, y 10..48.
-        G.pic("Brightness_Auto_Pressed", 34.5, 27.5 + off)
+        -- A knob press (confirm) in Manual shows the same green wedge, without
+        -- the Auto bar, while the page slides out (video 1:29.6).
+        if not st.bright_auto then G.clip(60, 0, 320, 80 + off) end
         G.pic("Brightness_Panel_Auto", 135.5, 28.5 + off)
+        if not st.bright_auto then G.unclip() end
+        -- beyond the level: black in Auto, the Manual grey in the confirm flash
         local lx = 65.5 + 188 * st.backlight
-        if lx < 253.5 then G.rect(lx, 10 + off, 254, 48 + off, C.black) end
+        if lx < 253.5 then
+            G.rect(lx, 10 + off, 254, 48 + off, st.bright_auto and C.black or manual_rest)
+        end
         G.pic("Brightness_Slider_Mask", 160, 29 + off)
     else
-        -- grey thumb (Brightness_Pusher) at the current level on the gradient
-        local x0, x1 = 60 + 19, 231 - 19
-        G.pic("Brightness_Pusher", x0 + (x1 - x0) * st.backlight, 33.5 + off)
-        -- "%": in Auto it is part of Brightness_Slider_Mask (x 93.5..103.5,
-        -- baseline 36); Manual has no mask, so the same glyph comes from the
-        -- raster font
-        G.glyph_c(G.rfont("bold", 10), "%", 98.5, 36 + off, C.white)
+        -- Manual (video 1:26.2 / 1:28.0, frames 2588, 2640): the same wedge as
+        -- Auto, flat cyan up to the level and grey beyond it, inside a 2 px
+        -- cyan frame (the slider is what the knob adjusts). Panel_Main's
+        -- gradient (x 66.5..253.5, y 10..48) is painted over.
+        local lx = 65.5 + 188 * st.backlight
+        G.rect(66.5, 10 + off, math.min(lx, 253.5), 48 + off, manual_fill)
+        if lx < 253.5 then G.rect(lx, 10 + off, 253.5, 48 + off, manual_rest) end
+        -- black above the wedge, and the "%" (x 93.5..103.5, baseline 36)
+        G.pic("Brightness_Slider_Mask", 160, 29 + off)
+        G.box(66, 9.5 + off, 254, 48.5 + off, C.cyan, 2)
     end
     G.led_field("white_lr", tostring(U.round(st.backlight * 100)), 3, 78, 41 + off, 0.84)
     -- battery cell: none without a battery (AFMS 4-2 figure)
@@ -271,11 +421,19 @@ end
 -- Dialogs, boot
 -----------------------------------------------------------------------------
 
+-- Shut_Ongoing is the text-free dialog; the texts
+-- and the 3-2-1 count are raster text where the old art had them: 11 px
+-- xbold titles (title ink centre x 155.5, as drawn in the old art), 29 px
+-- bold digits (old "321" sheet: ink centre 159, baseline 106). Ink weights
+-- matched against the old art: xbold text 84 %, bold digits 105-113 %.
 local function power_off_dialog(n)
     G.pic("Shut_Ongoing", 159.5, 120.5)
-    -- 321 sheet frames: blank, 1, 2, 3
-    local frame = (n > 3) and 0 or n
-    G.pic("321", 159, 120, nil, frame)
+    local fs = G.rfont("xbold", 11)
+    G.rstr_c(fs, "Power Off", 155.5, 162, C.white)
+    G.rstr_c(fs, "Hold To Power Off", 160, 74, C.white)
+    if n >= 1 and n <= 3 then
+        G.glyph_c(G.rfont("bold", 29), tostring(n), 159, 106, C.white)
+    end
 end
 
 local function power_lost_dialog(st)
@@ -284,7 +442,8 @@ local function power_lost_dialog(st)
 end
 
 function UI.boot(st)
-    local a = U.clamp(st.boot_t / 0.5, 0, 1)
+    -- fades in over 0.5 s and out over the last 0.5 s (real unit)
+    local a = math.min(U.clamp(st.boot_t / 0.5, 0, 1), U.clamp((cfg.boot_logo_s - st.boot_t) / 0.5, 0, 1))
     G.pic("G5_Garmin_Logo", 159, 121, G.rgba(1, 1, 1, a))
 end
 
@@ -319,7 +478,6 @@ function UI.framebuffer_pattern(fw, fh)
 end
 
 function UI.draw(D, st)
-    page_indicators(D, st)
     menu(D, st)
     popup(D, st)
     backlight(st)

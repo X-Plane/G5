@@ -5,12 +5,14 @@
 -- Validity comes from three sources:
 --   * external sensors and systems failed by X-Plane (config.ini [Failures]:
 --     magnetometer, GPS navigator, nav receivers, OAT probe; the internal
---     AHRS / air data keys are empty by default, see note.md 2026-10-14)
+--     AHRS / air data keys are empty by default: the G5 has its own sensors)
 --   * the G5's own faults: laminar/g5[_n]/fail_<name>, per unit, writable
 --   * state: power-up initialisation, AHRS alignment, power to the magnetometer
 --
 -- Results in the unit state table:
---   st.valid = { att, air, gps, mag, oat, tas, hdg_mode = "hdg" | "trk" | "fail", hdg_flag }
+--   st.valid = { att, air, gps, mag, oat, tas, hdg_mode = "hdg" | "trk" | "fail", hdg_flag,
+--                hdg_degraded, a429 }
+--   st.gps_vfr / st.gps_nav_lost: GPS navigation without ARINC 429 data (VFR)
 --   st.att_state = "valid" | "aligning" | "kwl" (keep wings level) | "fail"
 --   st.fail[name] = internal fault flags, st.ext[name] = external faults
 --   st.msgs = active message ids in table order, st.has_msg, st.msg_unseen
@@ -20,6 +22,8 @@ local U, Sys, cfg, st
 local F = {}
 
 -- internal faults (laminar/g5[_n]/fail_<name>)
+-- The order is the element index of the laminar/g5[_2]/fail int array
+-- (config.ini [Failures] lists it): only ever append, never insert.
 F.INTERNAL = {
     "ahrs",          -- inertial sensors: ATTITUDE FAIL
     "airdata",       -- pressure sensors: AIRSPEED / ALTITUDE FAIL
@@ -35,6 +39,9 @@ F.INTERNAL = {
     "mag_uncal", "mag_db", "sw_mismatch", "net_conflict", "comm_error", "factory_cal", "a429_cfg",
     -- GFC 500 messages (Pilot's Guide table 3-12)
     "afcs_key_stuck", "afcs_audio_db", "servo_clutch", "servo_trim_input",
+    -- 2026-10-29, no message (Pilot's Guide 1.4.1.2, AFMS 3-3):
+    "gad29",         -- GAD 29 failed (its power is gad_bus): no ARINC 429 navigation data
+    "mag_degraded",  -- magnetic heading valid but maybe outside its accuracy limits: yellow digits
 }
 
 -- external faults: config.ini key -> failure datarefs (6 = failed)
@@ -46,6 +53,12 @@ local EXTERNAL = {
     oat = "ext_fail_oat",
     ahrs = "ext_fail_ahrs",
     airdata = "ext_fail_airdata",
+    -- the G5's own GPS receiver and the degraded-magnetic-accuracy state have
+    -- no X-Plane failure of their own (failure_enum has no "degraded"); an
+    -- aircraft may map any failure dataref here. The
+    -- internal fault array laminar/g5[_2]/fail works as well.
+    gps_rx = "ext_fail_gps_rx",
+    mag_degraded = "ext_fail_mag_degraded",
 }
 
 -- System messages (Pilot's Guide table 1-2), in display order
@@ -109,7 +122,8 @@ function F.reset()
     for _, k in ipairs(F.INTERNAL) do st.fail[k] = false end
     st.ext = {}
     st.valid = { att = false, air = false, gps = false, mag = false, oat = false, tas = false,
-        hdg_mode = "fail", hdg_flag = false }
+        hdg_mode = "fail", hdg_flag = false, hdg_degraded = false, a429 = false }
+    st.gps_vfr, st.gps_nav_lost = false, false
     st.att_state = "fail"
     st.aligning = false
     st.heading_fail = true
@@ -174,15 +188,19 @@ local function update_messages(dt)
     m.net_conflict = fail.net_conflict
     m.comm_error = fail.comm_error or fail.net_conflict
     m.factory_cal = fail.factory_cal
-    m.sw_mismatch = fail.sw_mismatch
+    -- on both units when either has it (G5.lua cross_fill, two units)
+    -- one unit alone has no partner to mismatch with (nothing to compare with): no message
+    m.sw_mismatch = st.mismatch_link == true
     m.a429_cfg = fail.a429_cfg
     m.afcs_key_stuck = fail.afcs_key_stuck
     m.afcs_audio_db = fail.afcs_audio_db
     m.servo_clutch = fail.servo_clutch
     m.servo_trim_input = fail.servo_trim_input
-    m.overtemp = fail.overtemp
+    -- the fault, or the unit's own temperature model beyond its limits
+    -- (g5_system.lua update_battery: -20..+60 C, Installation Manual page 5)
+    m.overtemp = fail.overtemp or st.overtemp == true
     m.mag_fault = cfg.magnetometer ~= 0 and ext.mag
-    m.gps_fault = cfg.gps_internal ~= 0 and fail.gps_rx
+    m.gps_fault = cfg.gps_internal ~= 0 and (fail.gps_rx or ext.gps_rx)
     m.ext_gps = st.gps_external_only == true
     m.no_nav = st.nav_lost == true
 
@@ -215,7 +233,12 @@ function F.msg_icon_on()
     return math.floor(st.clock * 2) % 2 == 0
 end
 
-function F.update(dt, D)
+-- primary: the master's state when this unit is a slave (G5.lua link_units),
+-- nil otherwise. Sensor items (attitude, air data, GPS, magnetometer, OAT)
+-- come from the master while its item is valid, from this unit's own
+-- sensors otherwise; device faults (battery, display, hardware, ...) and
+-- messages stay this unit's own.
+function F.update(dt, D, primary)
     st.clock = st.clock + dt
     for key in pairs(EXTERNAL) do st.ext[key] = ext_failed(key) end
     local fail, ext, valid = st.fail, st.ext, st.valid
@@ -239,7 +262,7 @@ function F.update(dt, D)
 
     -- GPS: own receiver (needs time for a fix) or the navigator's position
     -- (needs aircraft power)
-    local int_ok = cfg.gps_internal ~= 0 and not fail.gps_rx and up >= cfg.gps_init_s
+    local int_ok = cfg.gps_internal ~= 0 and not (fail.gps_rx or ext.gps_rx) and up >= cfg.gps_init_s
     local ext_ok = cfg.gps_external ~= 0 and not ext.gps and st.ext_power and up >= cfg.air_init_s
     st.gps_int_ok = int_ok
     -- another unit's receiver over CAN (dual installations, G5.lua link_units)
@@ -271,6 +294,49 @@ function F.update(dt, D)
     -- OAT / TAS / winds come through the GAD 13 on the GAD breaker (gad_bus)
     local gad_ok = cfg.gad_bus < 0 or (D.bus_all and D.bus_all[cfg.gad_bus] or 0) >= cfg.power_min_volts
     valid.oat = not ext.oat and gad_ok
+    -- ARINC 429 navigation data reach the G5 through the GAD 29 (Installation
+    -- Manual 1.6.4), on the same GAD breaker. Without them, or on an RS-232
+    -- only installation, GPS navigation is "VFR" (Pilot's Guide p.26 note,
+    -- 1.4.1.2, AFMS 3-3); with no RS-232 GPS data either, the GPS course is
+    -- removed (Maintenance Manual 5.1.7.1). The fault is gad29, a failure
+    -- without a power loss (the GAD 13 keeps working).
+    valid.a429 = cfg.nav_interface == "arinc" and gad_ok and not fail.gad29
+    st.gps_vfr = not valid.a429
+    local rs232_gps = cfg.gps_external ~= 0 and not ext.gps and st.ext_power
+    st.gps_nav_lost = st.gps_vfr and not rs232_gps
+
+    st.att_from_master = false
+    if primary and primary.valid then
+        local pv = primary.valid
+        -- a unit's own AHRS / air data failure still shows on that unit
+        if pv.att and not (fail.ahrs or ext.ahrs) then
+            valid.att = true
+            st.att_state = primary.att_state
+            st.att_from_master = true
+        end
+        if pv.air and not (fail.airdata or ext.airdata) then valid.air = true end
+        if pv.gps then valid.gps = true end
+        if pv.mag then valid.mag = true end
+        if pv.oat then valid.oat = true end
+        if valid.mag then
+            valid.hdg_mode = "hdg"
+        elseif valid.gps then
+            valid.hdg_mode = "trk"
+        else
+            valid.hdg_mode = "fail"
+        end
+        valid.hdg_flag = cfg.magnetometer ~= 0 and not valid.mag
+    end
+    -- magnetic heading valid but possibly outside the internal accuracy
+    -- limits (Pilot's Guide 1.4.1.2): heading digits yellow, nothing else.
+    -- No sim data: the internal fault mag_degraded. A slave on the master's
+    -- magnetometer shows the master's state, and its own fault still counts
+    -- (review 2026-10-29: unit 2's fault index did nothing)
+    local degraded = fail.mag_degraded or ext.mag_degraded
+    if primary and primary.valid and primary.valid.mag then
+        degraded = degraded or primary.valid.hdg_degraded == true
+    end
+    valid.hdg_degraded = valid.hdg_mode == "hdg" and degraded
     valid.tas = valid.air and valid.oat
 
     -- the selected nav source has stopped sending

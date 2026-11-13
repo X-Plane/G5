@@ -45,10 +45,44 @@ function U.approach(v, target, rate, dt)
     return v
 end
 
+-- CSS-style cubic-bezier easing curve through (0,0), (x1,y1), (x2,y2), (1,1):
+-- returns f(t) for t in 0..1 (x solved by bisection, monotonic for x1, x2 in 0..1)
+function U.bezier(x1, y1, x2, y2)
+    return function(t)
+        if t <= 0 then return 0 end
+        if t >= 1 then return 1 end
+        local lo, hi, s = 0, 1, t
+        for _ = 1, 24 do
+            s = (lo + hi) / 2
+            local u = 1 - s
+            if 3 * u * u * s * x1 + 3 * u * s * s * x2 + s * s * s < t then lo = s else hi = s end
+        end
+        local u = 1 - s
+        return 3 * u * u * s * y1 + 3 * u * s * s * y2 + s * s * s
+    end
+end
+
+-- t in 0..1 with f(t) = v, for a rising curve f
+function U.inverse(f, v)
+    if v <= 0 then return 0 end
+    if v >= 1 then return 1 end
+    local lo, hi = 0, 1
+    for _ = 1, 24 do
+        local m = (lo + hi) / 2
+        if f(m) < v then lo = m else hi = m end
+    end
+    return (lo + hi) / 2
+end
+
 -- on/off flashing from a running clock (s): true for the first half of each period
 function U.blink(t, period)
     period = period or 1
     return (t % period) < period / 2
+end
+
+function U.sign(v)
+    if v > 0 then return 1 elseif v < 0 then return -1 end
+    return 0
 end
 
 function U.round(v)
@@ -146,6 +180,35 @@ function U.read_ini(path, defaults)
     return true
 end
 
+-- Set one "key = value" line in an ini file in place: the first line with that
+-- key (any case, any spacing) is replaced, every other line and the line
+-- endings are kept; a missing key is appended. Returns false when the file
+-- cannot be read or written.
+function U.ini_set(path, key, value)
+    local f = io.open(path, "rb")
+    if not f then return false end
+    local raw = f:read("*a")
+    f:close()
+    local nl = raw:find("\r\n", 1, true) and "\r\n" or "\n"
+    if raw:sub(-1) ~= "\n" then raw = raw .. "\n" end
+    local lines, done = {}, false
+    for l in raw:gmatch("(.-)\r?\n") do
+        local line = l
+        local k = line:match("^%s*([^;#=%s]+)%s*=")
+        if not done and k and string.lower(k) == string.lower(key) then
+            line = key .. " = " .. value
+            done = true
+        end
+        lines[#lines + 1] = line
+    end
+    if not done then lines[#lines + 1] = key .. " = " .. value end
+    f = io.open(path, "wb")
+    if not f then return false end
+    f:write(table.concat(lines, nl), nl)
+    f:close()
+    return true
+end
+
 -- Write `pairs` ({ {key, value}, ... }) as "key = value" lines, with an
 -- optional comment header. Returns false when the file cannot be written.
 function U.write_ini(path, pairs, header)
@@ -228,20 +291,167 @@ function U.gets(h, max_len)
     return table.concat(chars)
 end
 
--- Custom int/float datarefs. Setter is optional (nil = read-only).
-function U.reg_int(name, getter, setter)
-    return XPLMRegisterDataAccessor(name, XPLMDataTypeID.xplmType_Int, setter ~= nil,
-        getter, setter,
-        nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
-        nil, nil)
+-- Custom int/float datarefs and command handlers. xLua keeps (persists)
+-- every callback function handed to the SDK, against a budget of 500 that
+-- the aircraft's xLua scripts appear to share (X-Plane crashed once when
+-- another xLua script in the same aircraft ran out of it). So all of them go through a few
+-- named callbacks; the refcon is the entry id, and the per-dataref /
+-- per-command functions stay in Lua tables here. Setter is optional (nil =
+-- read-only). Getters and setters keep the SDK argument order: (ref) and
+-- (ref, value); command functions get (cmd, phase, ref).
+local acc = {}           -- id -> { getter, setter }
+local acc_id = {}        -- dataref handle -> id
+local cmds = {}          -- id -> handler
+local arrs = {}          -- id -> { n, getter, setter } (int arrays)
+local next_id = 0
+
+local function dr_get(ref)
+    local e = acc[ref]
+    if e == nil then return 0 end
+    return e[1](ref) or 0
 end
 
-function U.reg_float(name, getter, setter)
-    return XPLMRegisterDataAccessor(name, XPLMDataTypeID.xplmType_Float, setter ~= nil,
-        nil, nil,
-        getter, setter,
-        nil, nil, nil, nil, nil, nil, nil, nil,
-        nil, nil)
+local function dr_set(ref, v)
+    local e = acc[ref]
+    if e and e[2] then e[2](ref, v) end
+end
+
+local function cmd_handler(cmd, phase, ref)
+    local f = cmds[ref]
+    if f == nil then return true end
+    return f(cmd, phase, ref) ~= false
+end
+
+local function reg(name, int, getter, setter)
+    next_id = next_id + 1
+    local id = next_id
+    acc[id] = { getter, setter }
+    local set = setter and dr_set or nil
+    local h
+    if int then
+        h = XPLMRegisterDataAccessor(name, XPLMDataTypeID.xplmType_Int, setter ~= nil,
+            dr_get, set, nil, nil,
+            nil, nil, nil, nil, nil, nil, nil, nil, id, id)
+    else
+        h = XPLMRegisterDataAccessor(name, XPLMDataTypeID.xplmType_Float, setter ~= nil,
+            nil, nil, dr_get, set,
+            nil, nil, nil, nil, nil, nil, nil, nil, id, id)
+    end
+    if h == nil then
+        acc[id] = nil
+    else
+        acc_id[h] = id
+    end
+    return h
+end
+
+function U.reg_int(name, getter, setter) return reg(name, true, getter, setter) end
+function U.reg_float(name, getter, setter) return reg(name, false, getter, setter) end
+
+function U.unreg_dataref(h)
+    if h == nil then return end
+    XPLMUnregisterDataAccessor(h)
+    local id = acc_id[h]
+    if id then
+        if id < 0 then arrs[-id] = nil else acc[id] = nil end
+        acc_id[h] = nil
+    end
+end
+
+-- returns the id to pass to U.unreg_cmd
+function U.reg_cmd(cmd, fn)
+    next_id = next_id + 1
+    cmds[next_id] = fn
+    XPLMRegisterCommandHandler(cmd, cmd_handler, true, next_id)
+    return next_id
+end
+
+function U.unreg_cmd(cmd, id)
+    if id == nil then return end
+    XPLMUnregisterCommandHandler(cmd, cmd_handler, true, id)
+    cmds[id] = nil
+end
+
+-- Int array dataref (xLua 2 array contract, example_scripts/XplmTest
+-- TestGetArrayOfInts): the reader returns the element count when outvalues
+-- is nil, otherwise fills outvalues[1..max] from element `offset`. The
+-- writer gets (ref, values, offset, count). getter(i) / setter(i, v) use
+-- 0-based element numbers.
+
+local function dr_get_vi(ref, out, offset, max)
+    local e = arrs[ref]
+    if e == nil then return 0 end
+    if out == nil then return e[1] end
+    local m = math.min(max or e[1], e[1] - (offset or 0))
+    for i = 1, m do out[i] = e[2](offset + i - 1) end
+    return math.max(0, m)
+end
+
+local function dr_set_vi(ref, values, offset, count)
+    local e = arrs[ref]
+    if e == nil or e[3] == nil or values == nil then return end
+    for i = 1, count or 0 do
+        local k = (offset or 0) + i - 1
+        if k >= 0 and k < e[1] and values[i] ~= nil then e[3](k, values[i]) end
+    end
+end
+
+function U.reg_int_array(name, n, getter, setter)
+    next_id = next_id + 1
+    local id = next_id
+    arrs[id] = { n, getter, setter }
+    local h = XPLMRegisterDataAccessor(name, XPLMDataTypeID.xplmType_IntArray, setter ~= nil,
+        nil, nil, nil, nil, nil, nil,
+        dr_get_vi, setter and dr_set_vi or nil,
+        nil, nil, nil, nil, id, id)
+    if h == nil then
+        arrs[id] = nil
+    else
+        acc_id[h] = -id      -- negative: an array entry
+    end
+    return h
+end
+
+-- Output datarefs in xLua's own storage (XLuaCreateDataRef, the engine of
+-- XLua 1's create_dataref): read-only, no Lua callback handed to the SDK,
+-- so they cost none of the callback budget. The script writes the value
+-- (U.native_set) once per frame. nil when xLua does not offer it; the
+-- caller then registers a normal accessor instead.
+function U.native_ok()
+    return XLuaCreateDataRef ~= nil and XLuaSetNumber ~= nil
+end
+
+function U.native_number(name)
+    if not U.native_ok() then return nil end
+    local ok, h = pcall(XLuaCreateDataRef, name, "number", "no", nil)
+    if ok and h ~= nil then return h end
+    return nil
+end
+
+function U.native_set(h, v)
+    XLuaSetNumber(h, v)
+end
+
+-- writable variant (no notifier: the script polls U.native_get each frame);
+-- nil when xLua does not allow it
+function U.native_number_w(name)
+    if not U.native_ok() or XLuaGetNumber == nil then return nil end
+    local ok, h = pcall(XLuaCreateDataRef, name, "number", "yes", nil)
+    if ok and h ~= nil then return h end
+    return nil
+end
+
+function U.native_get(h)
+    return XLuaGetNumber(h)
+end
+
+-- live entries (test-only: nothing may be left after XPluginDisable)
+function U.live_callbacks()
+    local n = 0
+    for _ in pairs(acc) do n = n + 1 end
+    for _ in pairs(cmds) do n = n + 1 end
+    for _ in pairs(arrs) do n = n + 1 end
+    return n
 end
 
 -----------------------------------------------------------------------------

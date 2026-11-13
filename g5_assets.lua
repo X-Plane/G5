@@ -1,30 +1,33 @@
 -- g5_assets.lua: every PNG in Textures/ (imported 1:1 from the 2024-2025 G5
--- artwork by tools/import_assets.py). key = path without ".png".
+-- artwork). key = path without ".png".
 -- Sprite sheets list their cell grid {cx, cy}. Text and LED digits come from
 -- the raster fonts in Textures/RFont (g5_rfont_data.lua).
 
 local A = {}
 
 A.IMAGES = {
-    "321", "ALIGNING", "ALT_Bug_Box", "ALT_Tape", "AP_Aimer", "Aimer_1",
-    "ArtHori_BG", "ArtHori_Gradients", "ArtHori_Words", "ArtHori_Ladder", "BATT_Charging_Icon", "BATT_NoCharge_Icon", "BATT_Icon", "BATT_Icon_25", "BATT_PFD_Box",
+    "ALIGNING", "ALT_Bug_Box", "ALT_Tape", "AP_Aimer", "Aimer_1",
+    "ArtHori_BG", "ArtHori_Gradients", "ArtHori_Words", "ArtHori_Ladder", "ArtHori_Ladder_Exp", "BATT_Charging_Icon", "BATT_NoCharge_Icon", "BATT_Icon", "BATT_Icon_25", "BATT_PFD_Box",
     "Baro_Box", "Baro_Unit_in", "Brightness_Auto_Pressed", "Brightness_Panel_Auto", "Brightness_Panel_Main",
     "Brightness_Pusher", "Brightness_Slider_Mask", "Bug_ALT", "Bug_HDG", "Bug_SPD",
     "Ext_Power_Lost_UI", "FD_Aimer", "G5_Garmin_Logo", "GPSS_ON_Bar", "GS_Box",
     "HDG_Bug_Box", "HDG_Num_Box", "HDG_Ticks", "HDG_Shade", "HSI_AC_Icon", "HSI_BG", "Bug_TRK", "HSI_TRK_Bug",
-    -- batch G (tools/make_batch_g_art.py)
+    -- hollow bugs, boxes, menu blanks
     "HDG_Num_Box_W", "TRK_Num_Box", "HSI_HDG_Box_O", "HSI_TRK_Box", "Bug_HDG_Hollow",
     "HSI_HDG_Bug_Hollow", "HSI_Fixed_NoRing", "ALT_Bug_Box_Alert", "Pops_Menu_Blank",
     "Cyan_Bars_3_dashes", "Cyan_Bars_5_dashes",
-    -- batch E (tools/make_batch_e_art.py)
-    "Tile_Back", "Tile_Message", "Tile_GPSS", "Tile_HSI", "Tile_PFD", "Tile_Blank", "Pops_Title_Bar",
+    -- antialiased nav symbols, white, tinted
+    "HSI_HDG_Box_L", "Tile_Setup", "Icon_Back",
+    "Nav_Diamond", "Nav_Triangle", "HSI_CRS_Needle", "HSI_CDI_Bar", "HSI_ToFrom", "HSI_Track_Mark",
+    -- tiles, rose and HSI boxes
+    "Tile_Back", "Tile_Message", "Tile_GPSS", "Tile_HSI", "Tile_PFD", "Tile_Blank", "Tile_BlankBar", "Pops_Title_Bar",
     "HSI_Circles_Rot", "HSI_Fixed", "HSI_HDG_Box", "HSI_HDG_Bug", "HSI_HDG_Bug_Box", "HSI_MSG",
     "HSI_Options_5", "HSI_Options_6", "HSI_Round_Marks", "Has_message_Icon", "Heading_Fail",
     "Horizontal_GS", "INN_Turn_Tri", "Menu_Altitude_Units", "Menu_Horizontal_Bar",
     "Menu_Option_Base", "No_SPD", "OAT_Box", "OAT_C", "OAT_F", "OUT_Turn_Tri",
     "PFD_Menu_Selected", "PFD_Options_5", "PFD_Options_6", "Pops_Menu_Altitude",
     "Pops_Menu_Course", "Pops_Menu_Heading", "Pops_Menu_OBS", "Pops_Menu_VOR",
-    "Pops_Msg_Type_1", "Pops_Msg_Type_2", "Pops_Msg_Type_3", "Red_Arrows", "Roll_Indicator", "Roll_Arc",
+    "Pops_Msg_Type_1", "Pops_Msg_Type_2", "Pops_Msg_Type_3", "Red_Arrows", "Red_Arrows_Split", "Roll_Indicator", "Roll_Arc_Sheet",
     "SPD_ALT_Box", "SPD_ALT_Shade", "SPD_Bug_Box", "SPD_Strip_Barber", "SPD_Strip_Green",
     "SPD_Strip_Red", "SPD_Strip_White", "SPD_Strip_White_Line", "SPD_Strip_Yellow",
     "SPD_Tape", "SPD_Unit",
@@ -40,13 +43,19 @@ A.IMAGES = {
 
 -- sprite sheets: {cells_x, cells_y}; frame i (0-based) = left to right, top to bottom
 A.SHEETS = {
-    ["321"] = { 4, 1 },            -- blank, 3, 2, 1
     ["BATT_Icon"] = { 5, 1 },      -- empty (red) .. full (green)
-    ["BATT_Icon_25"] = { 5, 1 },   -- the same, 25 px frames (tools/make_batch_c_art.py)
+    ["BATT_Icon_25"] = { 5, 1 },   -- the same, 25 px frames
     ["VS_Symbol"] = { 2, 1 },      -- up, down
     ["Menu_Altitude_Units"] = { 2, 1 }, -- stacked "ft", "m"
     ["SPD_Unit"] = { 1, 2 },       -- KT, MPH
-    ["ArtHori_Ladder"] = { 73, 1 }, -- one pitch-ladder line per cell (tools/make_ladder_sheet.py)
+    ["ArtHori_Ladder"] = { 73, 1 }, -- one pitch-ladder line per cell
+    -- the same with "5" .. "45" on the 5-deg lines, for Pitch Display
+    -- "Expanded", and the unusual-attitude chevrons split into a sky and a
+    -- ground cell, so each group keeps its pitch on that scale (one cell per
+    -- ladder line, the same layout as ArtHori_Ladder, so the code only swaps sheets)
+    ["ArtHori_Ladder_Exp"] = { 73, 1 },
+    ["Red_Arrows_Split"] = { 2, 1 },
+    ["Roll_Arc_Sheet"] = { 15, 1 }, -- roll arc, radius 7 px larger .. 7 px smaller
 }
 
 -- LED digit fonts, drawn from the raster fonts (A.RFONT, g5_gfx G.led). They
@@ -61,14 +70,19 @@ A.FONTS = {
     white      = { face = "bold", cell = FULL, ink = 22, scale = 0.5, color = "FFFFFF" },
     offwhite   = { face = "bold", cell = FULL, ink = 22, scale = 0.5, color = "BFBFBF" },
     cyan       = { face = "bold", cell = FULL, ink = 22, scale = 0.5, color = "95CFDC" },
-    green      = { face = "bold", cell = FULL, ink = 22, scale = 0.5, color = "6AD974" },
+    green      = { face = "bold", cell = FULL, ink = 22, scale = 0.5, color = "3BBF1A" },
     magenta    = { face = "bold", cell = FULL, ink = 22, scale = 0.5, color = "AD66AF" },
     cyan_xb    = { face = "xbold", cell = FULL, ink = 23, scale = 0.5, color = "95CFDC" },
+    magenta_xb = { face = "xbold", cell = FULL, ink = 23, scale = 0.5, color = "AD66AF" },   -- Heading tile in track
     yellow_xb  = { face = "xbold", cell = FULL, ink = 23, scale = 0.5, color = "E4E137" },
+    -- heading digits while the magnetic heading may be outside its accuracy
+    -- limits (Pilot's Guide 1.4.1.2): white / white_lr in yellow
+    yellow     = { face = "bold", cell = FULL, ink = 22, scale = 0.5, color = "E4E137" },
     white_lr   = { face = "bold", cell = LOW, ink = 12, scale = 1, color = "FFFFFF" },
     cyan_lr    = { face = "bold", cell = LOW, ink = 12, scale = 1, color = "95CFDC" },
     magenta_lr = { face = "bold", cell = LOW, ink = 12, scale = 1, color = "AD66AF" },
-    ap         = { face = "bold", cell = LOW, ink = 12, scale = 1, color = "74C14C" },
+    yellow_lr  = { face = "bold", cell = LOW, ink = 12, scale = 1, color = "E4E137" },
+    ap         = { face = "bold", cell = LOW, ink = 12, scale = 1, color = "3BBF1A" },
 }
 
 return A

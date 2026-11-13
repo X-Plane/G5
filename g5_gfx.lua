@@ -38,7 +38,7 @@ function G.rgba(r, g, b, a)
     return XPLMMakeColor(r, g, b, a or 1)
 end
 
--- Palette sampled from the 2024-2025 G5 PNG artwork (cockpit_3d/generic/G5).
+-- Palette sampled from the G5 PNG artwork (cockpit_3d/generic/G5).
 function G.init_colors()
     local C = G.C
     C.black      = hex("000000")
@@ -52,10 +52,14 @@ function G.init_colors()
     C.shade_hdg  = hex("000000", 0.45)
     C.cyan       = hex("40D8F0")
     C.cyan_box   = hex("7FC8D8")
-    C.magenta    = hex("D040D0")
-    C.magenta_dk = hex("B040B0")
-    C.green      = hex("70C040")
-    C.green_nav  = hex("30E030")
+    -- the magenta of the GS / DTK LED digits (Num_Magenta_Bold: #AD66AF); all
+    -- magenta art is recoloured to it (offline tool, not included)
+    C.magenta    = hex("AD66AF")
+    C.magenta_dk = hex("8A528C")
+    -- one green, from the airspeed tape art (SPD_Strip_Green: #3BBF1A); all
+    -- green art is recoloured to it (offline tool, not included)
+    C.green      = hex("3BBF1A")
+    C.green_nav  = C.green
     C.yellow     = hex("F0E000")
     C.yellow_dk  = hex("7A7000")
     C.red        = hex("F01000")
@@ -79,7 +83,7 @@ function G.black_alpha(a)
 end
 
 -----------------------------------------------------------------------------
--- Fonts (TTF placeholders, see README "Fonts")
+-- Fonts (TTF placeholders)
 -----------------------------------------------------------------------------
 
 G.font = nil      -- bold, numbers and labels
@@ -108,7 +112,7 @@ end
 local CAP = 0.71
 
 -----------------------------------------------------------------------------
--- Raster fonts (g5_rfont_data.lua, baked by tools/make_raster_fonts.py):
+-- Raster fonts (g5_rfont_data.lua, baked by an offline tool, not included):
 -- GM SansSerif pre-rasterised per pixel size on the 320x240 screen grid.
 -- A size is the cap ("H") height in screen px. Glyph cells are drawn 1:1 at
 -- whole screen pixels, so text is exactly as coarse as the LCD at every size.
@@ -129,11 +133,13 @@ local function rf_pick(face, px)
         local d = math.abs(sz - want)
         if d < bd then best, bd = sz, d end
     end
+    if best == nil then return nil end
     if bd > 0 and not rf_warned[face .. want] then
         rf_warned[face .. want] = true
         print(string.format("[G5 XLua2] raster font %s %d px not baked, using %d px", face, want, best))
     end
-    return G.rf[face][best]
+    local fsz = G.rf[face]
+    return fsz and fsz[best]
 end
 G.rf_pick = rf_pick
 
@@ -158,9 +164,29 @@ local function codepoints(str)
     return n
 end
 
--- one glyph with its origin at screen pixel column px (snapped), baseline row base
+-- Glyph origins snap to whole screen pixels (true to pixel). Text that slides
+-- with an image (tape labels, drums, heading labels) turns snapping off along
+-- its motion with G.subpixel(x, y): it then keeps its fractional position,
+-- the atlas filtering moves it smoothly, and it no longer steps up to 1 px
+-- behind the tape ticks. Always switch it back off after the moving block.
+local free_x, free_y = false, false
+function G.subpixel(x, y)
+    free_x, free_y = x and true or false, y and true or false
+end
+
+-- v + off for a free axis: off (half a glyph / string size) is snapped against
+-- v's whole-pixel part and only v's own fraction stays continuous, so a label
+-- whose anchor is on a whole pixel lands exactly where snapping would put it
+local function keep_frac(v, off)
+    local i = math.floor(v)
+    return (v - i) + math.floor(i + off + 0.5)
+end
+
+-- one glyph with its origin at column px, baseline row base (snapped unless free)
 local function rf_glyph(fs, gl, px, base, col)
-    local l = (math.floor(px + 0.5) - fs.ox) * S
+    if not free_x then px = math.floor(px + 0.5) end
+    if not free_y then base = math.floor(base + 0.5) end
+    local l = (px - fs.ox) * S
     local b = (base - fs.oy) * S
     XPLMTextureAtlasDrawIn(G.atlas, fs.base + gl[1], col, l, b + fs.ch * S, l + fs.cw * S, b)
 end
@@ -181,11 +207,10 @@ local function rf_text(fs, str, x, y, col, just)
     local pen = x
     if just == JC then pen = x - rf_width(fs, n) / 2
     elseif just == JR then pen = x - rf_width(fs, n) end
-    local base = math.floor(y + 0.5)
     for k = 1, n do
         local gl = fs.g[cps[k]]
         if gl then
-            rf_glyph(fs, gl, pen, base, col)
+            rf_glyph(fs, gl, pen, y, col)
             pen = pen + gl[2]
         end
     end
@@ -196,14 +221,22 @@ function G.rfont(face, px)
     return G.rf and rf_pick(face, px)
 end
 
+-- advance width of a string in a raster face (screen px)
+function G.rstr_w(fs, str)
+    if fs == nil then return 0 end
+    return rf_width(fs, codepoints(str))
+end
+
 -- string in a raster face, y = baseline
 function G.rstr(fs, str, x, y, col, just)
+    if fs == nil then return end  -- face missing (partial install): draw nothing
     rf_text(fs, str, x, y, col, just or JL)
 end
 
 -- string with its ink (first glyph's left edge .. last glyph's right edge)
 -- centred on cx, y = baseline; replaces centred label images
 function G.rstr_c(fs, str, cx, y, col)
+    if fs == nil then return end
     local n = codepoints(str)
     local first, last
     for k = 1, n do
@@ -214,13 +247,15 @@ function G.rstr_c(fs, str, cx, y, col)
     end
     if first == nil then return end
     local w = rf_width(fs, n) - last[2] + last[4] - first[3]
-    rf_text(fs, str, cx - w / 2 - first[3], y, col, JL)
+    local off = -w / 2 - first[3]
+    rf_text(fs, str, free_x and keep_frac(cx, off) or cx + off, y, col, JL)
 end
 
 -- one character with its ink centred on cx, y = baseline
 function G.glyph_c(fs, ch, cx, y, col)
+    if fs == nil then return end
     local gl = fs.g[string.byte(ch)]
-    if gl then rf_glyph(fs, gl, cx - (gl[4] - gl[3]) / 2 - gl[3], math.floor(y + 0.5), col) end
+    if gl then rf_glyph(fs, gl, cx - (gl[4] - gl[3]) / 2 - gl[3], y, col) end
 end
 
 -- rolling digit drum (replaces the old 0..9 strip images): digit d has its
@@ -431,6 +466,7 @@ end
 
 -- letters stacked top to bottom, centred on cx, centred vertically on cy
 function G.vtext(fs, str, cx, cy, pitch, col)
+    if fs == nil then return end
     local n = #str
     local top = cy + (n - 1) * pitch / 2
     for i = 1, n do
@@ -440,6 +476,7 @@ end
 
 -- small black box with a yellow label and a red X (HDG, GS, OAT, TAS fields)
 function G.fail_flag(label, x0, y0, x1, y1, px, fill)
+    -- a missing raster face only drops the label (G.rstr_c ignores nil)
     G.rect(x0, y0, x1, y1, fill or G.C.black)
     G.rstr_c(G.rfont("bold", px or 8), label, (x0 + x1) / 2, (y0 + y1) / 2 - (px or 8) / 2, G.C.yellow)
     G.red_x(x0 + 1, y0 + 1, x1 - 1, y1 - 1, 2)
@@ -470,6 +507,12 @@ function G.translate(dx, dy)
 end
 
 -- angle in degrees, positive counter-clockwise (XPLM convention)
+-- uniform scale about the current origin (XPLMTransformScale). Clips are
+-- tracked by translation only: do not set a clip inside a scaled block.
+function G.scale(k)
+    XPLMTransformScale(k, k)
+end
+
 function G.rotate(cx, cy, deg)
     XPLMTransformRotate(cx * S, cy * S, deg)
 end
@@ -521,6 +564,7 @@ function G.reset_clip()
     for i = #clip_stack, 1, -1 do clip_stack[i] = nil end
     for i = #tstack, 1, -1 do tstack[i] = nil end
     tx, ty = 0, 0
+    free_x, free_y = false, false
 end
 
 -----------------------------------------------------------------------------
@@ -631,6 +675,15 @@ function G.image_c(key, cx, cy, tint, frame)
 end
 G.pic = G.image_c
 
+-- scaled by k, centred on (cx, cy) (texture-filtered: for small icons)
+function G.pic_k(key, cx, cy, k, tint, frame)
+    local i = G.img[key]
+    if i == nil then return false end
+    local s = G.size[key]
+    XPLMTextureAtlasDrawScaled(G.atlas, i + (frame or 0), tint or white(), cx * S, cy * S, s[1] / 2, s[2] / 2, S * k, S * k, 0)
+    return true
+end
+
 -- native size, rotated clockwise by deg about its centre placed at (cx, cy)
 function G.pic_rot(key, cx, cy, deg_cw, tint, frame)
     local i = G.img[key]
@@ -659,7 +712,7 @@ function G.led(font, str, cx, cy, size, period_w)
         n = n + ((string.sub(str, k, k) == ".") and period_w or cw)
     end
     local x = cx - n / 2
-    local base = math.floor(cy - fs.size / 2 + 0.5)
+    local base = free_y and keep_frac(cy, -fs.size / 2) or cy - fs.size / 2
     for k = 1, #str do
         local b = string.byte(str, k)
         local adv = (b == 46) and period_w or cw

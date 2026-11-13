@@ -27,6 +27,10 @@ Cfg.hooks = nil
 
 function Cfg.init(util, gfx, sys, fail, pfd, config)
     U, G, Sys, Fail, Pfd, cfg = util, gfx, sys, fail, pfd, config
+    -- GPS Steering is a row (and so a state-file key) only with ap_option =
+    -- gpss; otherwise a stale gpss_menu in the state file must not override
+    -- the value derived from ap_option (G5.lua load_state reads Cfg.KEYS)
+    if config.ap_option ~= "gpss" then Cfg.KEYS.gpss_menu = nil end
     C = G.C
     st = Sys.st
 end
@@ -42,11 +46,17 @@ end
 local function enum(label, key, opts, scope, also)
     return { kind = "enum", label = label, key = key, opts = opts, scope = scope, also = also }
 end
+-- lo / hi: numbers, or functions when a limit depends on another setting
 local function num(label, key, scope, lo, hi, step, fmt)
     return { kind = "num", label = label, key = key, scope = scope, lo = lo, hi = hi, step = step, fmt = fmt }
 end
+local function bound(b)
+    if type(b) == "function" then return b() end
+    return b
+end
 -- V-speeds are kept in knots and shown / edited in the airspeed unit; 0 =
--- the aircraft's own value (`base`, the colour band limits) or not shown
+-- the aircraft's own value (`base`: band limits and every reference the .acf
+-- has) or not shown (VR)
 local function vspd(label, key, base)
     return { kind = "vspeed", label = label, key = key, scope = "shared", base = base }
 end
@@ -63,17 +73,40 @@ end
 local function action(label, proc, scope, show)
     return { kind = "action", label = label, proc = proc, scope = scope, show = show }
 end
+-- a setting or procedure of the real unit that has nothing to act on in the
+-- sim (test equipment, an analog autopilot): listed
+-- with its default value in grey, marked "*", not selectable; the page gets
+-- a footnote saying so. Demo rows belong to the master unit's pages (master
+-- flag), so a second unit does not list a page that holds only grey rows
+local function demo(label, value, show)
+    return { kind = "demo", label = label .. " *", value = value, show = show, master = true }
+end
 
 local ON_OFF = { { 1, "Enabled" }, { 0, "Disabled" } }
 local SHOW = { { 1, "Show" }, { 0, "Hide" } }
 local function deg1(v) return string.format("%.1f°", v) end
 local function pct(v) return tostring(U.round(v * 100)) .. "%" end
+local function secs(v) return (v <= 0) and "Off" or string.format("%.1f s", v) end
+-- Minimum / Maximum Photocell Input: whole % of the photocell reading. The
+-- shipped value reads "Default", the word of the Installation Manual tables
+local function photo(default)
+    return function(v)
+        if U.round(v) == default then return "Default" end
+        return tostring(U.round(v)) .. "%"
+    end
+end
 
 local PAGES = {
     { title = "Device Information", rows = {
         info("Installation Type", "Certified Instrument"),
         info("Unit", function() return "SFD" .. (Cfg.hooks and Cfg.hooks.n or 1) end),
         info("Software Version", Cfg.VERSION),
+        info("Role", function()
+            local r = st.role_eff
+            if r == "slave" then return "Slave" end
+            if r == "takeover" then return "Master (take-over)" end
+            return "Master"
+        end),
         status("SFD1", function() return Cfg.hooks.unit_ok(1) end),
         status("SFD2", function() return Cfg.hooks.unit_ok(2) end,
             function() return Cfg.hooks.n_units() >= 2 end),
@@ -86,7 +119,9 @@ local PAGES = {
     } },
     { title = "Attitude", rows = {
         info("Indicator Type", "Normal", true),
-        info("Pitch Display", "Normal", true),
+        -- the Installation Manual tables only name "Normal"; "Expanded" is
+        -- our name for the other look (Pilot's Guide figures 2-5 / 2-6)
+        enum("Pitch Display", "pitch_display", { { "normal", "Normal" }, { "expanded", "Expanded" } }, "shared"),
         enum("Roll Display", "roll_pointer", { { "ground", "Ground Pointer" }, { "sky", "Sky Pointer" } }, "shared"),
         enum("Standard Turn Roll Ref.", "std_turn_ref", SHOW, "shared"),
         enum("Automatic Declutter", "unusual_revert", ON_OFF, "unit"),
@@ -99,30 +134,58 @@ local PAGES = {
         info("Air Data Sensors", "Enabled", true),
         -- one switch for everything the GAD 13 provides (OAT, TAS, wind)
         enum("Outside Air Temp Sensor", "show_oat", ON_OFF, "shared", { "show_tas", "show_wind" }),
-        enum("Vertical Speed Indicator", "vsi_scale", { { 15, "1500 fpm" }, { 30, "3000 fpm" } }, "shared"),
+        -- the text follows the VS unit (g5_pfd VSI_METRIC: 8 / 15 m/s)
+        enum("Vertical Speed Indicator", "vsi_scale",
+            { { 15, function() return cfg.vs_unit == 1 and "8 m/s" or "1500 fpm" end },
+              { 30, function() return cfg.vs_unit == 1 and "15 m/s" or "3000 fpm" end } }, "shared"),
+        demo("Calibrate Static Pressure", "..."),
     } },
     { title = "Airspeed", rows = {
         vspd("VNE", "vne", true), vspd("VNO", "vno", true), vspd("VSO", "vso", true),
-        vspd("VS1", "vs1", true), vspd("VFE", "vfe", true), vspd("VA", "va"),
-        vspd("VX", "vx"), vspd("VY", "vy"), vspd("VG", "vg"), vspd("VR", "vr"),
-        vspd("VMC", "vmc"), vspd("VYSE", "vyse"),
+        vspd("VS1", "vs1", true), vspd("VFE", "vfe", true), vspd("VA", "va", true),
+        vspd("VX", "vx", true), vspd("VY", "vy", true), vspd("VG", "vg", true), vspd("VR", "vr"),
+        vspd("VMC", "vmc", true), vspd("VYSE", "vyse", true),
     } },
     { title = "Magnetometer", rows = {
         enum("Magnetometer", "magnetometer", ON_OFF, "shared"),
         info("Orientation", "Aft", true),
         action("Calibrate Magnetometer", "magnetometer", "shared",
             function() return cfg.magnetometer ~= 0 end),
+        demo("Interference Test", "...", function() return cfg.magnetometer ~= 0 end),
     } },
     { title = "Flight Controls", rows = {
         info("Garmin Autopilot Servos", function() return Cfg.hooks.gfc() and "GFC 500" or "None" end, true),
-        enum("GPS Steering", "gpss_menu", ON_OFF, "shared"),
+        -- only with ap_option = gpss (config.ini): an ESP installation has a
+        -- GFC 500, which never has GPS steering
+        (function()
+            local r = enum("GPS Steering", "gpss_menu", ON_OFF, "shared")
+            r.show = function() return cfg.ap_option == "gpss" end
+            return r
+        end)(),
         enum("Flight Director", "fd_cue", { { "single", "Single Cue" }, { "dual", "Dual Cue" } }, "shared"),
+        -- Pilot's Guide Rev M 3.3.5.2.1 says "if configured"; no manual says
+        -- where, so this row is our choice (default off)
+        enum("Heading Bug Auto Sync", "hdg_sync", ON_OFF, "shared"),
+        demo("GPSS Scale Factor", "1.00", function() return cfg.ap_option == "gpss" end),
     } },
     { title = "Backlight", rows = {
         info("Current Mode", function() return st.bright_auto and "Automatic" or "Manual" end),
         enum("Default Mode", "backlight_auto_initial", { { 1, "Automatic" }, { 0, "Manual" } }, "unit"),
         num("Manual Level", "backlight_initial", "unit", 0.05, 1, 0.01, pct),
         num("Minimum Brightness", "backlight_min", "unit", 0.01, 0.5, 0.01, pct),
+        -- Maximum Display Brightness caps the backlight (Auto and the knob);
+        -- Filter Time Constant smooths the photocell in Auto (g5_system.lua)
+        num("Maximum Brightness", "backlight_max", "unit", 0.5, 1, 0.01, pct),
+        num("Filter Time Constant", "backlight_filter_s", "unit", 0, 10, 0.5, secs),
+        -- the two ends of the Auto curve on the photocell axis (Sys.auto_level);
+        -- the manuals give no range or units: whole % of the photocell reading,
+        -- never closer than Sys.PHOTO_GAP (our choice). The live reading below
+        -- is what the limits are set against (ours; not an Installation Manual row)
+        num("Minimum Photocell Input", "photocell_min", "unit", 0,
+            function() return math.max(0, (cfg.photocell_max or 100) - Sys.PHOTO_GAP) end, 1, photo(0)),
+        num("Maximum Photocell Input", "photocell_max", "unit",
+            function() return math.min(100, (cfg.photocell_min or 0) + Sys.PHOTO_GAP) end, 100, 1, photo(100)),
+        info("Photocell Input", function() return tostring(U.round(Sys.photocell_pct())) .. "%" end),
     } },
     { title = "Display", rows = {
         enum("HSI Page", "hsi_page", ON_OFF, "unit"),
@@ -149,20 +212,32 @@ local PAGES = {
     { title = "Navigation", rows = {
         enum("Navigation Data", "nav_data", ON_OFF, "shared"),
         enum("Navigators", "nav_count", { { 1, "One" }, { 2, "Two" } }, "shared"),
+        -- full scale of the VNAV chevron (Installation Manual 5.3.1 note 5)
+        (function()
+            local r = enum("VNAV Deviation Scale", "vnav_dev_scale", { { 500, "±500 ft" }, { 1000, "±1000 ft" } }, "shared")
+            r.show = function() return cfg.nav_data ~= 0 end
+            return r
+        end)(),
+        -- Installation Manual: "Disabled" if a mechanical CDI or HSI is connected
+        -- to the navigator, else "Enabled". With two navigators the manual has
+        -- Selected Course 1 / 2; the sim has one HSI course (hsi_obs), so one
+        -- row covers both (our choice). Listed last, not before the VNAV row as
+        -- in the manual, so the rows above keep their places.
+        enum("Selected Course", "selected_course", ON_OFF, "shared"),
     } },
     { title = "Units", rows = {
-        info("Altitude", "Feet", true),
+        enum("Altitude", "alt_unit", { { 0, "Feet" }, { 1, "Meters" } }, "shared"),
         info("Distance", "Nautical Miles", true),
         enum("Airspeed", "speed_unit", { { 0, "Knots" }, { 1, "MPH" }, { 2, "km/h" } }, "shared"),
         enum("Ground Speed", "gs_unit", { { -1, "As Airspeed" }, { 0, "Knots" }, { 1, "MPH" }, { 2, "km/h" } }, "shared"),
         info("Navigation Angle", "Magnetic", true),
         enum("Temperature", "temp_unit", { { 0, "Fahrenheit" }, { 1, "Celsius" } }, "shared"),
-        info("Vertical Speed", "Feet/Minute", true),
-        enum("Pressure", "baro_unit", { { 0, "inHg" }, { 1, "hPa" } }, "shared"),
+        enum("Vertical Speed", "vs_unit", { { 0, "Feet/Minute" }, { 1, "Meters/Second" } }, "shared"),
+        enum("Pressure", "baro_unit", { { 0, "inHg" }, { 1, "hPa" }, { 2, "mb" } }, "shared"),
     } },
     { title = "RS-232", rows = {
-        info("Input Format", function() return (cfg.nav_interface == "rs232") and "Garmin VHF NAV" or "None" end),
-        info("Output Format", "None"),
+        info("Input Format", function() return (cfg.nav_interface == "rs232") and "Garmin VHF NAV" or "None" end, true),
+        info("Output Format", "None", true),
     } },
     { title = "ARINC 429", rows = {
         info("Input 1", function() return (cfg.nav_interface == "arinc") and "Garmin GPS" or "None" end, true),
@@ -215,8 +290,15 @@ local function visible_pages()
     return vpages
 end
 
+-- titles of the pages this unit lists (used by the headless test)
+function Cfg.page_titles()
+    local t = {}
+    for _, pg in ipairs(visible_pages()) do t[#t + 1] = pg.title end
+    return t
+end
+
 local function selectable(r)
-    return r.kind ~= "info" and r.kind ~= "status"
+    return r.kind ~= "info" and r.kind ~= "status" and r.kind ~= "demo"
 end
 
 -----------------------------------------------------------------------------
@@ -232,7 +314,9 @@ end
 
 local function value_text(r, v, D)
     if r.kind == "enum" then
-        return r.opts[opt_index(r, v)][2]
+        local t = r.opts[opt_index(r, v)][2]
+        if type(t) == "function" then t = t() end
+        return t
     elseif r.kind == "num" then
         return r.fmt(v)
     elseif r.kind == "vspeed" then
@@ -247,7 +331,7 @@ local function step_value(r, v, dir, D)
         return r.opts[U.clamp(opt_index(r, v) + dir, 1, #r.opts)][1]
     elseif r.kind == "num" then
         local n = U.round((v + dir * r.step) / r.step) * r.step
-        return U.clamp(n, r.lo, r.hi)
+        return U.clamp(n, bound(r.lo), bound(r.hi))
     elseif r.kind == "vspeed" then
         local k = Pfd.speed_value(1)
         local disp
@@ -613,6 +697,8 @@ local function draw_page(s, D)
             if r.ok() then check_mark(cx, top - 8, 0.8) else red_x(cx, top - 8, 0.7) end
         elseif r.kind == "action" then
             G.rstr(fs, "...", CELL_X1 - 4, yb, C.white, G.JR)
+        elseif r.kind == "demo" then
+            G.rstr(fs, r.value, CELL_X1 - 4, yb, C.grey, G.JR)
         elseif r.kind ~= "back" then
             local editing = s.edit == r
             local v = editing and s.val or cfg[r.key]
@@ -623,6 +709,13 @@ local function draw_page(s, D)
         if i == s.sel and not s.edit then G.box(5.5, top - 16.5, 312.5, top - 0.5, C.cyan, 1.5) end
     end
     scrollbar(first, n)
+    -- footnote for "*" rows (pages with them have rows to spare)
+    for i = 1, n do
+        if rows[i].kind == "demo" then
+            G.rstr(G.rfont("bold", 8), "* For illustration only: no function in the sim.", 12, 6, C.grey)
+            break
+        end
+    end
 end
 
 -- Done / Start / ... buttons (figure 6-3: 96 x 55, bottom centre)

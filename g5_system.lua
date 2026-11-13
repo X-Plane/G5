@@ -8,7 +8,10 @@
 --     brightness, so "up to 4 hours" only holds at a low backlight
 --   * CC/CV charging from aircraft power inside the charge temperature window
 --   * the battery follows the panel temperature (OAT + offset, slow); outside
---     the operating range it cannot power the unit
+--     the operating range (-20..+60 C, Installation Manual page 5) it cannot
+--     power the unit, and "Unit temperature limit exceeded" ("Unit is too hot
+--     or too cold", Pilot's Guide table 1-2, AFMS 7-2) is shown while the
+--     unit is on; on the battery the unit then powers off after critical_batt_s
 --   * state of charge persists between flights and sessions (G5.lua writes
 --     state_unit<n>.ini)
 -- Power loss (Installation Manual battery page "Automatic Power Off"):
@@ -55,6 +58,8 @@ function Sys.reset()
     st.pl_t = 0
     st.on_batt_t = 0             -- time on battery power (H:MM after ~1 min)
     st.crit_t = 0
+    st.overtemp = false          -- unit temperature beyond its limits (message)
+    st.overtemp_t = 0
 
     st.batt_pct = st.batt_pct or cfg.battery_initial_pct
     st.batt_temp = st.batt_temp or 20
@@ -86,6 +91,14 @@ function Sys.reset()
     st.popup_row = 1
     st.bright_open = false
     st.bright_anim = 0
+    st.anim = {}                 -- slide curves: [key] = { lin, open } (g5_input.lua)
+    st.menu_press = nil          -- menu tile drawn pressed
+    st.press_age = 0
+    st.press_pending = false
+    st.bright_press = false      -- backlight Auto button drawn pressed
+    st.bright_press_age = 0
+    st.bright_toggle_pending = false
+    st.bright_confirm = false    -- backlight wedge green while sliding out after a knob press
     st.pwr_down = false
     st.pwr_t = 0
     st.pwr_handled = false
@@ -98,7 +111,14 @@ function Sys.reset()
     st.alt_captured = false
     st.alt_alert_phase = 0
 
-    Sim.set_inst_brightness(cfg.brightness_rheostat, st.backlight)
+    -- the rheostat belongs to the acting master only (update_backlight); at
+    -- load a unit that is not installed, or a configured slave, leaves it
+    st.rheo_last = nil
+    if cfg.installed ~= 0 and (st.role_eff == nil and cfg.role == 0
+        or st.role_eff == "master" or st.role_eff == "takeover") then
+        Sim.set_inst_brightness(cfg.brightness_rheostat, st.backlight)
+        st.rheo_last = st.backlight
+    end
 end
 
 function Sys.is_on()
@@ -111,6 +131,7 @@ end
 
 function Sys.start_boot()
     if st.mode ~= Sys.OFF then return end
+    if cfg.installed == 0 then return end     -- its object is not in the aircraft
     if not st.ext_power and not batt_can_run() then return end
     st.mode = Sys.BOOT
     st.page = startup_page()
@@ -129,6 +150,7 @@ function Sys.start_boot()
     -- AFMS section 4, Maintenance Manual section 3)
     st.bright_auto = cfg.backlight_auto_initial ~= 0
     if not st.bright_auto then st.backlight = cfg.backlight_initial end
+    st.photocell = nil
     U.log("power on" .. (st.started_on_battery and " (battery)" or ""))
 end
 
@@ -183,9 +205,12 @@ local function finish_shutdown()
     st.started_on_battery = false
     st.crit_batt = false
     st.crit_t = 0
+    st.overtemp_t = 0
 end
 
 function Sys.set_page(p)
+    -- no HSI page on an attitude-only installation (hsi_page = 0)
+    if p == Sys.HSI and cfg.hsi_page == 0 then return end
     if p == Sys.PFD or p == Sys.HSI then
         st.page = p
         if st.mode == Sys.PFD or st.mode == Sys.HSI then st.mode = p end
@@ -216,6 +241,9 @@ local function update_battery(dt, D)
     local target = D.oat_c + cfg.battery_temp_offset + (on and 5 or 0)
     st.batt_temp = st.batt_temp + (target - st.batt_temp) * math.min(1, dt / cfg.battery_temp_tau_s)
     local t = st.batt_temp
+    -- the unit's temperature (the battery follows the panel) beyond the
+    -- operating range: the message (g5_fail.lua), whatever the power source
+    st.overtemp = st.mode >= Sys.PFD and (t < cfg.battery_op_temp_min or t > cfg.battery_op_temp_max)
 
     st.batt_present = cfg.battery_installed ~= 0 and not fail.no_batt
     local good = st.batt_present and not fail.battery
@@ -239,8 +267,10 @@ local function update_battery(dt, D)
     -- charging from aircraft power: constant current to battery_cv_pct, then
     -- tapering (constant voltage); "unable to charge" with a charger fault or
     -- outside the charge temperature window (Pilot's Guide 2.1.7)
-    st.cannot_charge = st.ext_power and good and (fail.charger or not temp_ok)
-    st.charging = st.ext_power and good and not fail.charger and temp_ok and st.batt_pct < 99.5
+    -- a unit that is not installed has no charger and loads no bus
+    local fitted = cfg.installed ~= 0
+    st.cannot_charge = fitted and st.ext_power and good and (fail.charger or not temp_ok)
+    st.charging = fitted and st.ext_power and good and not fail.charger and temp_ok and st.batt_pct < 99.5
     if st.charging then
         local rate = 100 * cfg.battery_charge_c
         if st.batt_pct > cfg.battery_cv_pct then
@@ -254,7 +284,7 @@ local function update_battery(dt, D)
 
     -- current taken from the aircraft bus (for plugin_bus_load_amps)
     local volts = st.bus_volts or 0
-    if st.ext_power and volts > 1 then
+    if fitted and st.ext_power and volts > 1 then
         st.bus_amps = (draw + charge_w) / volts
     else
         st.bus_amps = 0
@@ -276,7 +306,9 @@ local function auto_power_off_applies(D)
 end
 
 -- real_dt: wall-clock step for what the unit's own electronics time (boot
--- screen, shutdown fade), so they also run while X-Plane is paused
+-- screen, shutdown fade, the External Power Lost countdown and the critical
+-- battery / over-temperature graces), so they run at real speed whatever the
+-- time acceleration and also while X-Plane is paused
 local function update_power(dt, D, real_dt)
     st.bus_volts = (D.bus_all and D.bus_all[cfg.power_bus]) or D.bus_volts or 0
     st.ext_power = st.bus_volts >= cfg.power_min_volts
@@ -298,6 +330,7 @@ local function update_power(dt, D, real_dt)
         end
     end
 
+    local overtemp_wait = false
     if st.mode ~= Sys.OFF and not st.shutting then
         if st.ext_power then
             st.pl_active = false
@@ -306,10 +339,19 @@ local function update_power(dt, D, real_dt)
         elseif st.fail.battery and st.batt_present then
             -- "Critical battery fault! Powering off" (Pilot's Guide table 1-2)
             st.crit_batt = true
-            st.crit_t = st.crit_t + dt
+            st.crit_t = st.crit_t + real_dt
             if st.crit_t >= cfg.critical_batt_s then Sys.shutdown() end
         elseif not st.batt_usable then
-            finish_shutdown()      -- no battery (or too cold / hot): the screen just dies
+            if st.overtemp and st.batt_present then
+                -- a good battery that is too cold / hot: the message first
+                -- (the grace is the critical battery fault's), then a normal
+                -- power-off. Our reading: the manuals give no delay.
+                overtemp_wait = true
+                st.overtemp_t = st.overtemp_t + real_dt
+                if st.overtemp_t >= cfg.critical_batt_s then Sys.shutdown() end
+            else
+                finish_shutdown()  -- no battery: the screen just dies
+            end
         elseif st.batt_pct <= cfg.battery_cutoff_pct then
             Sys.shutdown()         -- empty
         elseif not st.on_battery then
@@ -320,7 +362,7 @@ local function update_power(dt, D, real_dt)
                     st.pl_active = true
                     st.pl_t = cfg.power_lost_countdown_s
                 end
-                st.pl_t = st.pl_t - dt
+                st.pl_t = st.pl_t - real_dt
                 if st.pl_t <= 0 then
                     st.pl_active = false
                     Sys.shutdown()
@@ -329,25 +371,89 @@ local function update_power(dt, D, real_dt)
         end
     end
 
+    if not overtemp_wait then st.overtemp_t = 0 end
+
     if st.shutting then
         st.fade = st.fade + real_dt / cfg.shutdown_fade_s
         if st.fade >= 1 then finish_shutdown() end
     end
 end
 
--- Auto (photocell) level: 100 % in daylight, falling towards
--- backlight_neutral at night; shown on the backlight page (AFMS 4-2) and
--- used as the level, so switching to Manual starts from it without a jump.
-function Sys.auto_level()
-    local a = math.max(st.ambient or 1, cfg.ambient_min)
-    return U.clamp(cfg.backlight_neutral + (1 - cfg.backlight_neutral) * a ^ 0.25, cfg.backlight_min, 1)
+-- Highest backlight level: configuration mode "Maximum Display Brightness"
+-- (backlight_max, default 100 %); never below backlight_min
+function Sys.backlight_max()
+    return U.clamp(cfg.backlight_max or 1, cfg.backlight_min, 1)
 end
 
-local function update_backlight(D)
+-- The photocell as the unit reads it: X-Plane's ambient level through a
+-- first-order filter of backlight_filter_s ("Filter Time Constant"), on sim
+-- time; 0 = no filter (the raw level, as before 2026-10-29). Restarts at
+-- the current light at every power-up.
+local function photocell()
+    if (cfg.backlight_filter_s or 0) > 0 and st.photocell then return st.photocell end
+    return st.ambient or 1
+end
+
+local function update_photocell(dt)
+    local tau = cfg.backlight_filter_s or 0
+    local raw = st.ambient or 1
+    if tau <= 0 or st.photocell == nil then
+        st.photocell = raw
+    elseif dt > 0 then
+        st.photocell = st.photocell + (raw - st.photocell) * (1 - math.exp(-dt / tau))
+    end
+end
+
+-- The photocell reading, 0..1: the (filtered) ambient level ^ 0.25, about 0.39
+-- at night (0.024) and 1 in daylight. Shown in % on the Backlight page.
+local function photocell_reading()
+    return math.max(photocell(), cfg.ambient_min) ^ 0.25
+end
+
+function Sys.photocell_pct()
+    return 100 * photocell_reading()
+end
+
+-- Minimum / Maximum Photocell Input (configuration mode Backlight page), % of
+-- the reading: the ends of the Auto curve on the photocell axis. The two limits
+-- keep PHOTO_GAP % between them (our rule: the manuals give no range or
+-- units), whatever a hand-edited config.ini or state file says.
+Sys.PHOTO_GAP = 5
+function Sys.photocell_limits()
+    local lo = U.clamp(cfg.photocell_min or 0, 0, 100 - Sys.PHOTO_GAP)
+    local hi = U.clamp(cfg.photocell_max or 100, lo + Sys.PHOTO_GAP, 100)
+    return lo, hi
+end
+
+-- Auto (photocell) level: backlight_neutral at or below the Minimum Photocell
+-- Input, 100 % at or above the Maximum, straight in between. The shipped
+-- limits (0 / 100) make that today's curve, backlight_neutral + (1 -
+-- backlight_neutral) x reading, to the last bit. Shown on the backlight page
+-- (AFMS 4-2) and used as the level, so switching to Manual starts from it
+-- without a jump. Capped at the Maximum Display Brightness.
+function Sys.auto_level()
+    local lo, hi = Sys.photocell_limits()
+    lo, hi = lo / 100, hi / 100
+    local t = U.clamp((photocell_reading() - lo) / (hi - lo), 0, 1)
+    return U.clamp(cfg.backlight_neutral + (1 - cfg.backlight_neutral) * t, cfg.backlight_min,
+        Sys.backlight_max())
+end
+
+local function update_backlight(dt, D)
+    update_photocell(dt)
     if st.bright_auto then st.backlight = Sys.auto_level() end
-    st.backlight = U.clamp(st.backlight, cfg.backlight_min, 1)
-    if cfg.brightness_rheostat >= 0 then
-        Sim.set_inst_brightness(cfg.brightness_rheostat, st.backlight)
+    st.backlight = U.clamp(st.backlight, cfg.backlight_min, Sys.backlight_max())
+    -- the panel rheostat follows the acting master's backlight only: two
+    -- units writing the same index would fight, and a unit that is not
+    -- installed has no say. Written when the value changes.
+    local owner = cfg.installed ~= 0 and (st.role_eff == "master" or st.role_eff == "takeover")
+    if owner and cfg.brightness_rheostat >= 0 then
+        if st.rheo_last ~= st.backlight then
+            Sim.set_inst_brightness(cfg.brightness_rheostat, st.backlight)
+            st.rheo_last = st.backlight
+        end
+    else
+        st.rheo_last = nil
     end
 end
 
@@ -385,7 +491,7 @@ end
 function Sys.update(dt, D, real_dt)
     update_power(dt, D, real_dt or dt)
     update_battery(dt, D)
-    update_backlight(D)
+    update_backlight(dt, D)
     update_alt_alert(dt, D)
 
     -- unusual attitude: back to the PFD page (Pilot's Guide 1.5.1 note)
@@ -410,17 +516,23 @@ st.ambient = 1
 st.screen_ratio = 0
 function Sys.screen_brightness(ambient, no_store)
     local amb = (ambient ~= nil) and U.clamp(ambient, 0, 1) or st.ambient
+    -- the light is read while the unit is off too: the photocell starts from
+    -- the light at power-up, not from the last value seen while it was on
+    if not no_store then st.ambient = amb end
     if st.mode == Sys.OFF then
         if not no_store then st.screen_ratio = 0 end
         return 0
     end
+    -- in Auto the photocell (filtered, see photocell()) sets the base too:
+    -- with a filter time constant the screen follows a change of light late.
+    -- The popup window uses it as well (its own ambient is only the base in
+    -- Manual or without a filter), so both screens show the same level.
+    if st.bright_auto and (cfg.backlight_filter_s or 0) > 0 and st.photocell then amb = st.photocell end
+    local base = math.max(amb, cfg.ambient_min)
     if no_store then
-        local base = math.max(amb, cfg.ambient_min)
         local level = st.bright_auto and Sys.auto_level() or st.backlight
         return U.clamp(base * 2 ^ ((level - cfg.backlight_neutral) / cfg.backlight_doubling), 0, 1)
     end
-    st.ambient = amb
-    local base = math.max(st.ambient, cfg.ambient_min)
     local level = st.bright_auto and Sys.auto_level() or st.backlight
     st.screen_ratio = U.clamp(base * 2 ^ ((level - cfg.backlight_neutral) / cfg.backlight_doubling), 0, 1)
     return st.screen_ratio

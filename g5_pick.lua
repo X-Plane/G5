@@ -16,8 +16,18 @@ therefore ignored by X-Plane, and this module emulates them:
     fires twice.
   * Every frame the manipulator groups (knob, power button) are projected with
     the 3D-cockpit camera; one small, invisible, undecorated window is laid
-    tightly over each group. Nothing of the host aircraft outside those
+    tightly over each group (clipped to the screen; any size, so a zoomed-in
+    view keeps its clicks). Nothing of the host aircraft outside those
     rectangles is ever covered.
+  * Seen at an angle the G5 is a slanted shape, and its upright rectangle
+    reaches over its neighbours (a radio stacked below a transponder took
+    its 0 and 1 keys, 2026-11-04). So every frame: with the mouse over the
+    group's outline (convex hull of its click regions) the window comes to
+    the front once; with the mouse inside the rectangle but off the outline
+    the window steps aside, and the click goes to whatever is below (another
+    window, or the host). Misses inside the outline stay swallowed. Same rule
+    for every unit that uses this recipe; no click
+    pass-through (the SDK warns it breaks mouse tracking).
   * Inside a window, the mouse ray is intersected with the manipulator
     triangles: a hit fires the command (Begin on mouse down, End on mouse up,
     like X-Plane's own manipulators) and sets the cursor. Mouse wheel turns
@@ -34,7 +44,7 @@ local U, log, config
 local FT = 0.3048
 
 local slots = {}        -- attached G5.obj instances: base offset (m, CG frame), rotation, hide dataref
-local groups = {}       -- manipulator groups: { batches = {...}, verts = {...}, win = window }
+local groups = {}       -- manipulator groups: { batches = {...}, corners = {...}, win = window }
 local active = nil      -- { cmd = ref } command held by the current click
 local dr = {}
 local enabled = false
@@ -253,13 +263,22 @@ end
 local cam = { ok = false }
 local proj_m = {}
 
+local function num(x) return tonumber(tostring(x)) or 0 end
+
 local function bounds()
     local b = XPLMGetScreenBoundsGlobal()
-    local function num(x) return tonumber(tostring(x)) or 0 end
     if type(b) == "table" then
         return num(b.outLeft or b[1]), num(b.outTop or b[2]), num(b.outRight or b[3]), num(b.outBottom or b[4])
     end
     return 0, 0, 0, 0
+end
+
+-- mouse in global boxels, or nil
+local function mouse_xy()
+    if not XPLMGetMouseLocationGlobal then return nil end
+    local m = XPLMGetMouseLocationGlobal()
+    if type(m) ~= "table" then return nil end
+    return num(m.outX or m[1]), num(m.outY or m[2])
 end
 
 local function update_camera()
@@ -333,6 +352,37 @@ local function slot_visible(s)
 end
 
 local function to_cg(s, v) return add(to_parent(v, s.psi, s.the, s.phi), s.base) end
+
+-- 2D convex hull (monotone chain), counter-clockwise, of points { x, y }
+local function hull2d(pts)
+    table.sort(pts, function(a, b) return a[1] < b[1] or (a[1] == b[1] and a[2] < b[2]) end)
+    if #pts < 3 then return pts end
+    local function turn(o, a, b) return (a[1] - o[1]) * (b[2] - o[2]) - (a[2] - o[2]) * (b[1] - o[1]) end
+    local h = {}
+    for i = 1, #pts do
+        while #h >= 2 and turn(h[#h - 1], h[#h], pts[i]) <= 0 do h[#h] = nil end
+        h[#h + 1] = pts[i]
+    end
+    local lower = #h + 1
+    for i = #pts - 1, 1, -1 do
+        while #h >= lower and turn(h[#h - 1], h[#h], pts[i]) <= 0 do h[#h] = nil end
+        h[#h + 1] = pts[i]
+    end
+    h[#h] = nil
+    return h
+end
+
+-- inside a counter-clockwise convex polygon, or less than pad boxels outside
+-- it (the window is back before a quick click right at the edge)
+local function in_hull(h, x, y, pad)
+    if #h < 3 then return false end
+    for i = 1, #h do
+        local a, b = h[i], h[i % #h + 1]
+        local ex, ey = b[1] - a[1], b[2] - a[2]
+        if ex * (y - a[2]) - ey * (x - a[1]) < -pad * math.sqrt(ex * ex + ey * ey) then return false end
+    end
+    return true
+end
 
 -----------------------------------------------------------------------------
 -- Hit test
@@ -545,13 +595,21 @@ function P.load(obj_path, acf_path)
         b.center = { sx / n, sy / n, sz / n }
         local g = by_id[b.group]
         if not g then
-            g = { batches = {}, verts = {}, rect = { 0, 0, 0, 0 } }
+            g = { batches = {}, corners = {}, rect = { 0, 0, 0, 0 } }
             by_id[b.group] = g
             groups[#groups + 1] = g
         end
         g.batches[#g.batches + 1] = b
+        local lo, hi = { math.huge, math.huge, math.huge }, { -math.huge, -math.huge, -math.huge }
         for _, tri in ipairs(b.tris) do
-            for j = 1, 3 do g.verts[#g.verts + 1] = tri[j] end
+            for j = 1, 3 do
+                for k = 1, 3 do lo[k], hi[k] = math.min(lo[k], tri[j][k]), math.max(hi[k], tri[j][k]) end
+            end
+        end
+        -- the batch's box corners: the points of the G5's outline (hull)
+        for c = 0, (#b.tris > 0) and 7 or -1 do
+            g.corners[#g.corners + 1] = { (c % 2 == 0) and lo[1] or hi[1], (c % 4 < 2) and lo[2] or hi[2],
+                (c < 4) and lo[3] or hi[3] }
         end
     end
     status = string.format("%d manipulator group(s), %d batch(es)", #groups, #batches)
@@ -595,7 +653,7 @@ function P.enable()
             decorateAsFloatingWindow = XPLMWindowDecoration.xplm_WindowDecorationNone,
             layer = XPLMWindowLayer.xplm_WindowLayerFlightOverlay,
         })
-        g.shown = false
+        g.shown, g.over = false, false
     end
     enabled = true
 end
@@ -611,27 +669,44 @@ end
 function P.update()
     if not enabled then return end
     update_camera()
+    local mx, my = mouse_xy()
     for _, g in ipairs(groups) do
         local l, t, r, b = nil, nil, nil, nil
+        local over = false      -- the mouse is over the group's outline
+        local outlines = {}
         if cam.ok and not active then
             for _, s in ipairs(slots) do
                 if s.on and slot_visible(s) then
-                    for _, v in ipairs(g.verts) do
+                    -- the click regions' box corners: the window rect and the outline
+                    local pts = {}
+                    for _, v in ipairs(g.corners) do
                         local x, y = project(to_cg(s, v))
-                        if not x then l = nil; break end
+                        if not x then l, pts = nil, nil; break end
                         l = l and math.min(l, x) or x
                         r = r and math.max(r, x) or x
                         b = b and math.min(b, y) or y
                         t = t and math.max(t, y) or y
+                        pts[#pts + 1] = { x, y }
                     end
+                    if pts then outlines[#outlines + 1] = pts end
+                end
+            end
+            -- the outline only matters with the mouse inside the window
+            if l and mx and mx >= l - 2 and mx <= r + 2 and my >= b - 2 and my <= t + 2 then
+                for _, pts in ipairs(outlines) do
+                    over = over or in_hull(hull2d(pts), mx, my, 3)
                 end
             end
         end
         if active then
             -- keep the window still while a click is held
-        elseif l and r > cam.l and l < cam.r and t > cam.b and b < cam.t and (r - l) < (cam.r - cam.l) * 0.5 then
-            l, b = math.floor(l) - 1, math.floor(b) - 1
-            r, t = math.ceil(r) + 1, math.ceil(t) + 1
+        elseif l and r > cam.l and l < cam.r and t > cam.b and b < cam.t
+            and (mx or (r - l) < (cam.r - cam.l) * 0.95) then
+            -- no mouse position (no outline test): never a window over nearly
+            -- the whole screen, which would swallow the host's clicks
+            -- clipped to the screen: no size limit, a zoomed-in G5 keeps its clicks
+            l, b = math.max(math.floor(l) - 1, cam.l), math.max(math.floor(b) - 1, cam.b)
+            r, t = math.min(math.ceil(r) + 1, cam.r), math.min(math.ceil(t) + 1, cam.t)
             g.rect = { l, t, r, b }
             XPLMSetWindowGeometry(g.win, l, t, r, b)
             if config.pick_debug ~= 0 then
@@ -659,13 +734,21 @@ function P.update()
                     end
                 end
             end
-            if not g.shown then
-                XPLMSetWindowIsVisible(g.win, true)
-                g.shown = true
+            if mx and not over and mx >= l and mx <= r and my >= b and my <= t then
+                -- off the outline: step aside for the window or host below
+                hide(g)
+            else
+                if not g.shown then
+                    XPLMSetWindowIsVisible(g.win, true)
+                    g.shown = true
+                end
+                -- onto the outline: in front of a neighbour's overlapping window
+                if over and not g.over and XPLMBringWindowToFront then XPLMBringWindowToFront(g.win) end
             end
         else
             hide(g)
         end
+        if not active then g.over = over end
     end
 end
 

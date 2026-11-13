@@ -35,6 +35,7 @@ local REFS = {
     wind_spd     = "sim/cockpit2/gauges/indicators/wind_speed_kts",
     -- accelerations at the CG (vibration test, configuration mode)
     g_nrml       = "sim/flightmodel/forces/g_nrml",
+    agl_m        = "sim/flightmodel/position/y_agl",
     g_side       = "sim/flightmodel/forces/g_side",
     g_axil       = "sim/flightmodel/forces/g_axil",
 
@@ -44,6 +45,8 @@ local REFS = {
     vfe          = "sim/aircraft/view/acf_Vfe",
     vno          = "sim/aircraft/view/acf_Vno",
     vne          = "sim/aircraft/view/acf_Vne",
+    vmc          = "sim/aircraft/overflow/acf_Vmca",
+    vyse         = "sim/aircraft/overflow/acf_Vyse",
 
     -- Electrical / lighting
     bus_volts    = "sim/cockpit2/electrical/bus_volts",
@@ -69,6 +72,8 @@ local REFS = {
     gs_status    = "sim/cockpit2/autopilot/glideslope_status",
     vnav_status  = "sim/cockpit2/autopilot/vnav_status",
     alt_armed    = "sim/cockpit2/autopilot/altitude_hold_armed",
+    alts_armed   = "sim/cockpit2/autopilot/alts_armed",
+    gs_armed     = "sim/cockpit2/autopilot/glideslope_armed",
     hdg_is_gpss  = "sim/cockpit2/autopilot/heading_is_gpss",
     yd_on        = "sim/cockpit2/switches/yaw_damper_on",
     -- per-mode status (0 off, 1 armed, 2 active) for the AFCS status box
@@ -83,6 +88,8 @@ local REFS = {
     apr_status   = "sim/cockpit2/autopilot/approach_status",
     toga_status  = "sim/cockpit2/autopilot/TOGA_status",
     toga_lat_status = "sim/cockpit2/autopilot/TOGA_lateral_status",
+    roll_status  = "sim/cockpit2/autopilot/roll_status",
+    pitch_status = "sim/cockpit2/autopilot/pitch_status",
     fpa          = "sim/cockpit2/autopilot/fpa",
     -- autopilot health and trim
     otto_fail_warn = "sim/cockpit2/autopilot/otto_fail_warn",
@@ -125,13 +132,35 @@ local REFS = {
     gps_dme      = "sim/cockpit2/radios/indicators/gps_dme_distance_nm",
     gps_has_dme  = "sim/cockpit2/radios/indicators/gps_has_dme",
     gps_cdi      = "sim/cockpit/radios/gps_cdi_sensitivity",
-    gps_dtk      = "sim/cockpit/radios/gps_obs_degm",          -- desired track
+    -- desired track of the active leg, magnetic despite the name and its
+    -- "localizer course" description. Not gps_obs_degm: that is only the OBS
+    -- setting and does not follow the flight plan (GPS interop).
+    gps_dtk      = "sim/cockpit/radios/gps_course_degtm",
     gps_seq      = "sim/cockpit/radios/gps_sequencing",        -- 1 = OBS mode
+    -- VFR CDI scale, NO GP, GP armed, ALTS capture (X-Plane 12.4 datarefs):
+    -- an older X-Plane without one of them keeps that rule's old behaviour
+    gps_nm_dot   = "sim/cockpit/radios/gps_hdef_nm_per_dot",   -- GPS CDI scale, nm per dot
+    gps_xtk      = "sim/cockpit2/radios/indicators/gps_xtk",   -- cross-track error, nm
+    -- 1: a plugin drives the GPS CDI (then nothing writes gps_xtk)
+    override_gps = "sim/operation/override/override_gps",
+    gps_has_gs   = "sim/cockpit/radios/gps_has_glideslope",
+    -- altitude hold on: 1 = the preselected altitude (capture), 0 = where
+    -- the ALT key found the aircraft
+    alt_sel_any  = "sim/cockpit2/autopilot/alt_hold_is_alt_sel_any",
     altv_armed   = "sim/cockpit2/autopilot/altv_armed",
+    -- VNAV (the VDI chevron, g5_pfd P.vnav): the FMS vertical track error
+    -- (ft), path angle (deg), target altitude (ft) and distance to the top
+    -- of descent (nm). Whether X-Plane fills them depends on the aircraft's
+    -- navigator; the sign convention of fms_vtk is assumed, not confirmed.
+    fms_vtk      = "sim/cockpit2/radios/indicators/fms_vtk_pilot",
+    fms_vpa      = "sim/cockpit2/radios/indicators/fms_vpa_pilot",
+    fms_fpta     = "sim/cockpit2/radios/indicators/fms_fpta_pilot",
+    fms_tod      = "sim/cockpit2/radios/indicators/fms_distance_to_tod_pilot",
 }
 
 local COMMANDS = {
-    gpss        = "sim/autopilot/gpss",
+    gpss        = "sim/autopilot/gpss",     -- engages GPSS only (never toggles it off)
+    heading     = "sim/autopilot/heading",  -- HDG: the way out of GPSS
     hdg_sync    = "sim/autopilot/heading_sync",
     src_nav1    = "sim/autopilot/hsi_select_nav_1",
     src_nav2    = "sim/autopilot/hsi_select_nav_2",
@@ -152,6 +181,89 @@ function Sim.init(util, config)
 end
 
 local getf, geti = nil, nil
+
+-- LVL (GFC 500 Level mode). X-Plane has no Level mode: its
+-- sim/autopilot/return_to_level gives plain roll hold + pitch hold, the same
+-- datarefs as AP / FD alone. D.lvl is set only when ALL of these hold, so
+-- nothing but the Level command can explain the state:
+--   1. the pilot fired return_to_level (Sim.note_lvl, the G5 observes the
+--      command and passes it on unchanged),
+--   2. within LVL_WAIT_S of that, the sim is in roll + pitch hold
+--      (heading_mode 0, altitude_mode 3, roll_status 2, pitch_status 2),
+--   3. the autopilot is engaged (real unit: AP off ends Level, the flight
+--      director goes to ROL / PIT),
+--   4. no other lateral or vertical mode is active.
+-- It clears as soon as any of 2..4 breaks, and does not come back without
+-- another press (a later ROL / PIT from AP or FD alone stays ROL / PIT).
+local LVL_WAIT_S = 2
+local lvl_press_t, lvl_on = nil, false
+
+function Sim.note_lvl()
+    lvl_press_t = D.run_time or 0
+end
+
+local function lvl_state(D)
+    return D.servos_on ~= 0 and D.hdg_mode == 0 and D.alt_mode == 3
+        and D.roll_status == 2 and D.pitch_status == 2
+        and D.hdg_status == 0 and D.hdg_hold_status == 0 and D.track_status == 0
+        and D.nav_status ~= 2 and D.gpss_status ~= 2 and D.apr_status ~= 2 and D.bc_status ~= 2
+        and D.toga_status == 0 and D.toga_lat_status == 0
+        and D.vvi_status == 0 and D.speed_status == 0 and D.alt_hold_status ~= 2
+        and D.gs_status ~= 2 and D.vnav_status ~= 2 and D.fpa_status == 0
+end
+
+function Sim.update_lvl(D)
+    local ok = lvl_state(D)
+    if lvl_press_t then
+        local age = (D.run_time or 0) - lvl_press_t
+        if ok then
+            lvl_on, lvl_press_t = true, nil
+        elseif age > LVL_WAIT_S or age < 0 then
+            lvl_press_t = nil            -- the sim did not go into roll + pitch hold
+        end
+    end
+    if lvl_on and not ok then lvl_on = false end
+    D.lvl = lvl_on
+end
+
+-- "NO GP" (Pilot's Guide 2.3.3: the approach "downgrades past the final
+-- approach fix (FAF)"). X-Plane has no downgrade flag and no "past the FAF",
+-- so the rule is ours, from X-Plane's own values (not a unit's masked view;
+-- D.no_gp is shared, each unit masks it in Pfd.mask_nav):
+--   * an approach phase: gps_cdi_sensitivity >= 5 (4 = missed approach is not);
+--   * latch: the GPS source had a glidepath during that approach
+--     (gps_has_glideslope or a vertical deviation shown); a source other
+--     than GPS or the end of the approach phase clears it;
+--   * now: still that approach, GPS source, lateral guidance still valid (a
+--     downgrade, not the whole GPS lost), no glidepath any more, not
+--     suspended and not FROM (past the MAP or going around);
+--   * all of that for NO_GP_DELAY_S of simulator time (our rule, against
+--     flicker), cleared at once when it breaks. sdt is G5.lua's sim_step:
+--     0 while paused or in replay, so the timer stops there.
+local NO_GP_DELAY_S = 2.0
+local no_gp_seen, no_gp_t = false, 0
+
+function Sim.update_no_gp(D, sdt)
+    local gps = D.hsi_src == 2
+    local app = (D.gps_cdi or 0) >= 5
+    -- hsi_show_v (a vertical deviation shown) counts as "has a glidepath"; a
+    -- VNAV-driven vertical deviation in an approach phase would count too
+    -- (not seen in X-Plane 12.4 data)
+    local gp_now = gps and (D.gps_has_gs ~= 0 or D.hsi_show_v ~= 0)
+    if not gps or not app then
+        no_gp_seen = false
+    elseif gp_now then
+        no_gp_seen = true
+    end
+    local cond = no_gp_seen and app and gps and D.hsi_show_h ~= 0 and not gp_now
+        and D.gps_seq ~= 2 and D.hsi_fromto ~= 2
+    if cond then
+        no_gp_t = no_gp_t + (sdt or 0)
+    else
+        no_gp_t = 0
+    end
+    D.no_gp = cond and no_gp_t >= NO_GP_DELAY_S
+end
 
 function Sim.read()
     getf, geti = U.getf, U.geti
@@ -175,6 +287,7 @@ function Sim.read()
     D.wind_dir  = getf(H.wind_dir, 0)
     D.wind_spd  = getf(H.wind_spd, 0)
     D.g_nrml    = getf(H.g_nrml, 1)
+    D.agl_ft    = getf(H.agl_m, 0) * 3.28084
     D.g_side    = getf(H.g_side, 0)
     D.g_axil    = getf(H.g_axil, 0)
 
@@ -183,6 +296,8 @@ function Sim.read()
     D.vfe = getf(H.vfe, 0)
     D.vno = getf(H.vno, 0)
     D.vne = getf(H.vne, 0)
+    D.vmc = getf(H.vmc, 0)
+    D.vyse = getf(H.vyse, 0)
 
     -- every bus: each unit picks its own (config power_bus, per unit)
     D.bus_all = D.bus_all or {}
@@ -205,7 +320,13 @@ function Sim.read()
     D.gpss_status = geti(H.gpss_status, 0)
     D.gs_status   = geti(H.gs_status, 0)
     D.vnav_status = geti(H.vnav_status, 0)
-    D.alt_armed   = geti(H.alt_armed, 0)
+    -- ALTS armed: X-Plane's alts_armed (selected-altitude capture armed) or
+    -- altitude_hold_armed; the G5 read only the latter, so ALTS never showed
+    -- with the C172's autopilot. D.alt_hold_armed is altitude_hold_armed alone
+    -- (the ALTS capture gate: alts_armed is 1 almost always in X-Plane 12.4)
+    D.alt_armed   = math.max(geti(H.alt_armed, 0), geti(H.alts_armed, 0))
+    D.alt_hold_armed = geti(H.alt_armed, 0)
+    D.gs_armed    = geti(H.gs_armed, 0)
     D.hdg_is_gpss = geti(H.hdg_is_gpss, 0)
     D.yd_on       = geti(H.yd_on, 0)
     D.hdg_status  = geti(H.hdg_status, 0)
@@ -218,10 +339,17 @@ function Sim.read()
     D.bc_status   = geti(H.bc_status, 0)
     D.apr_status  = geti(H.apr_status, 0)
     D.toga_status = geti(H.toga_status, 0)
+    D.roll_status = geti(H.roll_status, 0)
+    D.pitch_status = geti(H.pitch_status, 0)
     D.toga_lat_status = geti(H.toga_lat_status, 0)
+    Sim.update_lvl(D)
     D.fpa         = getf(H.fpa, 0)
     D.otto_fail_warn = geti(H.otto_fail_warn, 0)
     D.ap_has_power = geti(H.ap_has_power, 1)
+    -- sim/cockpit2/annunciators/yaw_damper is documented as "failure" but is
+    -- the YD-on light (measured in X-Plane: 0 off, 1 on); X-Plane has no YD
+    -- failure dataref, so YD is unavailable only with the AP (servos / power)
+    D.yd_failed   = false
     D.trim_fail   = geti(H.trim_fail, 0)
     D.trim_up     = geti(H.trim_up, 0)
     D.trim_down   = geti(H.trim_down, 0)
@@ -230,6 +358,11 @@ function Sim.read()
     D.hdg_bug     = U.wrap360(getf(H.hdg_bug, 0))
     D.alt_bug     = getf(H.alt_bug, 0)
     D.alt_hold    = getf(H.alt_hold, D.alt_bug)
+    -- X-Plane's own selected altitude: view_begin (G5.lua) puts a unit's
+    -- own D.alt_bug in its place while cross-fill is off, the capture rule
+    -- (g5_pfd P.cap_update) compares the held altitude with the sim's
+    D.alt_dial_xp = D.alt_bug
+    D.alt_sel_any = H.alt_sel_any and geti(H.alt_sel_any, 0) or nil   -- nil: not available
     D.spd_bug     = getf(H.spd_bug, 0)
     D.vs_bug      = getf(H.vs_bug, 0)
 
@@ -261,7 +394,24 @@ function Sim.read()
     D.gps_cdi     = geti(H.gps_cdi, 1)
     D.gps_dtk     = U.wrap360(getf(H.gps_dtk, D.hsi_obs))
     D.gps_seq     = geti(H.gps_seq, 0)
+    D.gps_nm_dot  = getf(H.gps_nm_dot, 0)                       -- 0: not available
+    D.gps_xtk     = H.gps_xtk and getf(H.gps_xtk, 0) or nil      -- nil: not available
+    D.override_gps = geti(H.override_gps, 0)
+    D.gps_has_gs  = geti(H.gps_has_gs, 0)
+    -- the course the HSI needle, the DTK box and the PFD course marker show:
+    -- with a GPS source the active leg's desired track (X-Plane computes the
+    -- CDI deviation against it and does not slew the OBS to it), in GPS OBS
+    -- mode or without a GPS course the OBS, otherwise the selected course
+    if D.hsi_src == 2 and D.gps_seq ~= 1 and (D.gps_has_dme ~= 0 or D.gps_dme > 0) then
+        D.crs = D.gps_dtk
+    else
+        D.crs = D.hsi_obs
+    end
     D.altv_armed  = geti(H.altv_armed, 0)
+    D.fms_vtk     = getf(H.fms_vtk, 0)
+    D.fms_vpa     = getf(H.fms_vpa, 0)
+    D.fms_fpta    = getf(H.fms_fpta, 0)
+    D.fms_tod     = getf(H.fms_tod, 0)
 end
 
 -----------------------------------------------------------------------------
