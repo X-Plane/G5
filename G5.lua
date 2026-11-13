@@ -233,8 +233,9 @@ local config = {
     units = "auto",
     -- 0 = master, 1 = slave (per unit: unit<n>_role; unit 2 is a slave)
     role = 0,
-    -- GFC 500 installed: auto = what GFC500.System writes into
-    -- laminar/gfc500/installed; 0 / 1 = fixed
+    -- GFC 500 installed (a digital autopilot): auto = the provider's
+    -- laminar/afcs/cap_digital / cap_ias_mode / ap_pft when it has them, else
+    -- what GFC500.System writes into laminar/gfc500/installed; 0 / 1 = fixed
     gfc500 = "auto",
     -- per-unit values, set from settings.ini (unit_config picks unit<n>_<key>)
     unit2_startup_page = 2,
@@ -628,7 +629,7 @@ local function make_unit(n)
             local o = units[k]
             return o ~= nil and o.st.mode >= o.Sys.PFD and not o.st.fail.hardware
         end,
-        gfc = function() return gfc_installed ~= 0 end,
+        gfc = function() return Esp.pic.digital end,
         -- a confirmed change: applied at once, saved to the state file
         set = function(key, value, scope)
             if scope == "shared" then
@@ -825,7 +826,7 @@ local function draw_screen(u, ref)
         local view = view_begin(u)
         local ok, err
         if st.mode == Sys.PFD then
-            ok, err = pcall(u.Pfd.draw, D, st, gfc_installed ~= 0)
+            ok, err = pcall(u.Pfd.draw, D, st, Esp.pic.digital)
         else
             ok, err = pcall(u.Hsi.draw, D, st)
         end
@@ -1268,6 +1269,9 @@ local function link_units()
     cross_fill(m)
 end
 
+-- laminar/gfc500/installed keeps its value for the other scripts that use it;
+-- what the G5 draws from is the autopilot picture (g5_esp: gfc500 setting,
+-- then the provider's cap_ fields, then this value)
 local function read_gfc()
     if config.gfc500 == "1" then
         gfc_installed = 1
@@ -1276,11 +1280,21 @@ local function read_gfc()
     elseif gfc_native then
         gfc_installed = (U.native_get(gfc_native) or 0) ~= 0 and 1 or 0
     end
+    local pic = Esp.picture(config.gfc500, gfc_installed)
+    -- GPSS is for an analog autopilot: say once that this config meets a
+    -- digital one the provider announced (the item stays hidden). Only when
+    -- the picture follows the provider (gfc500 auto): with a fixed gfc500 the
+    -- digital picture is the installer's, not the provider's
+    if config.ap_option == "gpss" and config.gfc500 ~= "1" and config.gfc500 ~= "0"
+       and Esp.has("cap_digital") and pic.digital and not pic.warned then
+        pic.warned = true
+        log("ap_option = gpss, but the provider says the autopilot is digital (cap_digital 1): no GPSS item")
+    end
 end
 
 local function update_unit(u, sdt, dt)
-    u.In.gfc = gfc_installed ~= 0
-    u.Hsi.gfc = gfc_installed ~= 0
+    u.In.gfc = Esp.pic.digital
+    u.Hsi.gfc = Esp.pic.digital
     u.Sys.update(sdt, D, dt)
     u.Fail.update(sdt, D, u.primary)
     u.In.update(dt, D)     -- menus and button holds run in real time

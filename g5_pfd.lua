@@ -986,8 +986,9 @@ local function speed_tape(D, st, gfc)
 
     speed_unit_label()
 
-    -- airspeed reference bug: GFC 500 IAS mode only (Pilot's Guide 3.3.4.5)
-    if gfc and D.alt_mode == 5 then
+    -- airspeed reference bug: an autopilot with an IAS mode, while in it
+    -- (Pilot's Guide 3.3.4.5)
+    if P.ias_mode() and D.alt_mode == 5 then
         local rb = U.clamp((speed_value(D.spd_bug) - (spd - 30)) / 60, 0, 1)
         G.pic("Bug_SPD", 59.5, 0.5 + rb * 240)
     end
@@ -1500,14 +1501,22 @@ local function box_shadow(cx, cy, w, h)
     G.rect(x0 - 1, y0 - 1, x1 + 1, y1 + 1, G.black_alpha(0.45))
 end
 
+-- The autopilot has an IAS mode (the port's cap_ias_mode, else the installer's
+-- gfc500 setting / laminar/gfc500/installed): the airspeed reference bug and
+-- box while X-Plane is in that mode
+function P.ias_mode()
+    local E = P.Esp
+    return E ~= nil and E.pic.ias_mode
+end
+
 -- MAXSPD / MINSPD (Pilot's Guide 3.4.2, figures 3-23 / 3-24, table 3-11):
--- the autopilot unit is holding the speed off a configured limit. Only the
--- ESP half has data (g5_esp: esp_engaged bits 4 / 8 of the AFCS port);
--- with the autopilot engaged port v1 has no field (see g5_esp.lua). Both
--- set: MAXSPD. Needs valid air data (the tag sits on the speed tape's top).
+-- the autopilot unit is holding the speed off a configured limit. From the
+-- port's speed_protect field (autopilot on or off) when the provider has it,
+-- else only the ESP half (g5_esp: esp_engaged bits 4 / 8). Both set: MAXSPD.
+-- Needs valid air data (the tag sits on the speed tape's top).
 function P.spd_protect(D, st)
     local E = P.Esp
-    if E == nil or not E.usable() or not st.valid.air then return nil end
+    if E == nil or not E.speed_tag_ok() or not st.valid.air then return nil end
     if E.overspeed then return "MAXSPD" end
     if E.underspeed then return "MINSPD" end
     return nil
@@ -1538,7 +1547,7 @@ local function boxes_top(D, st, gfc)
         P.gpss_box(D, st, top + 1.5)
         top = top - 15
     end
-    if gfc and D.alt_mode == 5 and air then
+    if P.ias_mode() and D.alt_mode == 5 and air then
         local dn = (tas_shown or tag) and -17 or 0
         G.pic("SPD_Bug_Box", 32.5, top - 1 + dn)
         G.led_field("cyan_lr", tostring(U.round(speed_value(D.spd_bug))), 5, 21, top - 0.5 + dn)
@@ -2071,14 +2080,18 @@ local function ap_bar(D, st, gfc, show_modes, m)
 
     -- AP field (Pilot's Guide table 3-12): failures, preflight test, disconnect, engaged
     local up = st.up_t or 99
+    -- preflight test: the provider's ap_pft (0 none, 1 running, 2 failed), the
+    -- same on every unit; without it this unit times it from its own boot
+    local pft = P.Esp and P.Esp.pic.pft
     if D.otto_failed then
         afcs_word("AFCS", X_AP, "box", c.white, c.red)
-    elseif D.servos_failed or D.ap_has_power == 0 then
-        -- AP not available (servos failed, no autopilot power): yellow + red X
+    elseif D.servos_failed or D.ap_has_power == 0 or pft == 2 then
+        -- AP not available (servos failed, no autopilot power, preflight test
+        -- failed): yellow + red X
         afcs_word("AP", X_AP, "caution")
         G.line(X_AP - 9, 228, X_AP + 9, 239, c.red, 2)
         G.line(X_AP - 9, 239, X_AP + 9, 228, c.red, 2)
-    elseif gfc and up < cfg.afcs_pft_s then
+    elseif pft == 1 or (pft == nil and gfc and up < cfg.afcs_pft_s) then
         afcs_word("PFT", X_AP, "box", c.black, c.white)
     elseif fl.disc_abnormal then
         local on, phase = flashing(fl.disc_until, st)
@@ -2168,7 +2181,11 @@ function P.bar_wanted(D, st, gfc)
     -- the yaw damper alone also brings the bar up, showing only "YD" (real
     -- unit: FD and AP off, YD on)
     local yd_alone = D.yd_on ~= 0
-    local disp = cfg.show_ap_bar ~= 0 and (fd_on or alert or yd_alone or (gfc and cfg.ap_bar_reserved ~= 0))
+    -- the provider's preflight test (ap_pft 1 running, 2 failed) needs the AP
+    -- field even with the flight director off and an analog autopilot
+    local pft = P.Esp and P.Esp.pic.pft
+    local pft_up = pft == 1 or pft == 2
+    local disp = cfg.show_ap_bar ~= 0 and (fd_on or alert or yd_alone or pft_up or (gfc and cfg.ap_bar_reserved ~= 0))
     return disp, fd_on
 end
 
