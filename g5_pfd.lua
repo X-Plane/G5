@@ -52,19 +52,23 @@ local function nav_type(D)
     return (D.hsi_src == 1) and D.nav2_type or D.nav1_type
 end
 
--- a localizer is tuned: the receiver reports a LOC / ILS station, or (no
--- station received) the frequency is 108.10-111.95 MHz with an odd tenth.
+-- a localizer is tuned on the selected navigator: g5_sim reads it from the
+-- receiver's nav type bit mask (LOC / ILS bits), with the frequency
+-- 108.10-111.95 MHz (odd tenth) as the fallback when no station is named
+-- (Sim.nav_flags). A VOR is not a localizer.
 -- Source label, AFCS word and "NO LOC" all use this.
 local function loc_tuned(D)
-    local t = nav_type(D)
-    if t == 4 or t == 5 then return true end
-    local f = (D.hsi_src == 1) and D.nav2_freq or D.nav1_freq
-    return f >= 10810 and f <= 11195 and math.floor(f / 10) % 2 == 1
+    if D.hsi_src == 1 then return D.nav2_loc == true end
+    return D.nav1_loc == true
 end
 P.loc_tuned = loc_tuned
 
 -- a VOR / LOC is tuned on the selected navigator
-function P.nav_tuned(D) return nav_type(D) ~= 0 or loc_tuned(D) end
+function P.nav_tuned(D)
+    local sta = D.nav1_sta
+    if D.hsi_src == 1 then sta = D.nav2_sta end
+    return sta == true or loc_tuned(D)
+end
 
 -- Source names (Pilot's Guide table 2-1): GPS / VOR / LOC, with the
 -- navigator number only when two navigators are configured (nav_count).
@@ -197,8 +201,21 @@ local esp_vis, esp_wait = 0, 0
 local PITCH_FADE = { IN_S = 0.08, OUT_S = 0.2, HOLD_S = 0.35, off = 0 }
 local pitch_vis, pitch_dir = 0, 1
 
-local function esp_anim(dt, D)
+-- ESP indications (roll marks, pitch chevrons, MAXSPD / MINSPD, "ESP OFF") need
+-- this unit's own attitude valid and aligned: not during ALIGNING / KEEP WINGS
+-- LEVEL / ATTITUDE FAIL (the ESP provider ignores this G5 then too, G5.lua
+-- att_ok). Another display's heartbeat can still arm ESP.
+function P.esp_att_ok(st)
+    return st.valid.att and not st.aligning
+end
+
+local function esp_anim(dt, D, st)
     local E = P.Esp
+    if E ~= nil and not P.esp_att_ok(st) then
+        -- gone at once, no fade; they come in afresh when the attitude is valid
+        esp_vis, esp_wait, pitch_vis, PITCH_FADE.off = 0, 0, 0, PITCH_FADE.HOLD_S
+        return
+    end
     if E ~= nil and E.usable() and E.armed then
         esp_wait = esp_wait + dt
         if esp_wait >= ESP_DELAY_S then esp_vis = U.approach(esp_vis, 1, 1 / ESP_IN_S, dt) end
@@ -1203,7 +1220,7 @@ end
 function P.update(dt, D)
     update_speed_alive(D)
     local st = Sys.st
-    esp_anim(dt, D)
+    esp_anim(dt, D, st)
     P.trim_update(D, st, dt)
     -- every frame on any page: a capture that starts on the HSI page shows
     -- on the PFD page too
@@ -1360,7 +1377,8 @@ local function vdi(D, st)
         -- label cell: magenta "G" for a GPS glidepath, empty for an ILS
         -- glideslope (figures 2-23, 2-25)
         if D.hsi_src == 2 then G.rstr_c(G.rfont("bold", 8), "G", x, VDI_Y + 45, C.magenta) end
-    elseif (D.hsi_src == 2 and D.no_gp) or (D.hsi_src ~= 2 and loc_tuned(D)) then
+    elseif (D.hsi_src == 2 and D.no_gp) or (D.hsi_src ~= 2 and loc_tuned(D)
+            and not (D.hsi_src == 1 and D.nav2_gs or D.hsi_src ~= 1 and D.nav1_gs)) then
         -- NO GS (a localizer without a glideslope) and NO GP (the GPS approach
         -- lost its glidepath, D.no_gp): the manual has no NO GP figure, so it
         -- looks like NO GS (our rule)
@@ -1516,7 +1534,7 @@ end
 -- Needs valid air data (the tag sits on the speed tape's top).
 function P.spd_protect(D, st)
     local E = P.Esp
-    if E == nil or not E.speed_tag_ok() or not st.valid.air then return nil end
+    if E == nil or not E.speed_tag_ok() or not st.valid.air or not P.esp_att_ok(st) then return nil end
     if E.overspeed then return "MAXSPD" end
     if E.underspeed then return "MINSPD" end
     return nil
@@ -2272,7 +2290,7 @@ function P.draw(D, st, gfc)
     -- autopilot is off (with the AP on ESP is not available anyway); stacked,
     -- between the CDI and the baro / VS boxes (drawn after them)
     local E = P.Esp
-    if E ~= nil and E.usable() and not E.enabled and D.servos_on == 0 and st.valid.att then
+    if E ~= nil and E.usable() and not E.enabled and D.servos_on == 0 and P.esp_att_ok(st) then
         local fs = G.rfont("bold", 7)
         -- dark drop shadow (real unit): black copy 1 px down-right, then a
         -- softer one 1 px further

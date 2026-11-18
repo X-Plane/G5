@@ -121,9 +121,9 @@ local function bearing_for(src, D)
     if src == 1 then
         if D.gps_has_dme ~= 0 or D.gps_dme > 0 then return D.gps_brg end
     elseif src == 2 then
-        if D.nav1_type ~= 0 then return D.nav1_brg end
+        if D.nav1_sta then return D.nav1_brg end
     elseif src == 3 then
-        if D.nav2_type ~= 0 then return D.nav2_brg end
+        if D.nav2_sta then return D.nav2_brg end
     end
     return nil
 end
@@ -191,8 +191,10 @@ local function vdi(D, st)
         -- figure in the manual, drawn like NO GS (our rule)
         G.textc("NO GP", x, CY, 8, C.amber, G.JC, G.font_cond)
     elseif D.hsi_src ~= 2 and D.hsi_show_h ~= 0 then
-        local t = (D.hsi_src == 1) and D.nav2_type or D.nav1_type
-        if t == 4 or t == 5 then
+        -- a localizer without a glideslope (g5_sim Sim.nav_flags)
+        local loc, gs = D.nav1_loc, D.nav1_gs
+        if D.hsi_src == 1 then loc, gs = D.nav2_loc, D.nav2_gs end
+        if loc and not gs then
             G.textc("NO GS", x, CY, 8, C.amber, G.JC, G.font_cond)
         end
     end
@@ -271,8 +273,7 @@ end
 -- bottom inner corner.
 local function brg_label(v, D)
     if v == 1 then return "GPS" end
-    local t = (v == 3) and D.nav2_type or D.nav1_type
-    local w = (t == 4 or t == 5) and "LOC" or "VOR"
+    local w = ((v == 3) and D.nav2_loc or (v ~= 3 and D.nav1_loc)) and "LOC" or "VOR"
     if cfg.nav_count >= 2 then w = w .. ((v == 3) and "2" or "1") end
     return w
 end

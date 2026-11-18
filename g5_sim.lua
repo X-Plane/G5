@@ -265,6 +265,28 @@ function Sim.update_no_gp(D, sdt)
     D.no_gp = cond and no_gp_t >= NO_GP_DELAY_S
 end
 
+-- nav1_type / nav2_type are XPLMNavType bit flags (sim/cockpit2/radios/indicators/
+-- nav*_type is documented only as "enum"; measured 2026-11-18, X-Plane 12: VOR 4,
+-- KLAF ILS 110.30 = 40 = ILS 8 + GlideSlope 32). Airport 1, NDB 2, VOR 4, ILS 8,
+-- Localizer 16, GlideSlope 32, markers 64 / 128 / 256, Fix 512, DME 1024.
+-- Plain arithmetic instead of bit.band: same result, and the headless harness
+-- runs a Lua without the LuaJIT bit library.
+local function nav_bit(t, v) return math.floor(t / v) % 2 == 1 end
+
+-- loc: a localizer is tuned (type has bit 8 or 16; with no station named by the
+-- type (no VOR / ILS / LOC bit) the frequency 108.10-111.95 MHz with an odd
+-- tenth stands in). gs: the station has a glideslope (bit 32).
+-- A named VOR (bit 4, no LOC bit) is never a localizer, whatever the frequency.
+-- sta (third value): the receiver has a course signal (VOR / ILS / LOC bit);
+-- DME alone (1024) or nothing is not one.
+function Sim.nav_flags(t, freq)
+    local gs = nav_bit(t, 32)
+    if nav_bit(t, 8) or nav_bit(t, 16) then return true, gs, true end
+    if nav_bit(t, 4) then return false, gs, true end
+    local loc = freq >= 10810 and freq <= 11195 and math.floor(freq / 10) % 2 == 1
+    return loc, gs, false
+end
+
 function Sim.read()
     getf, geti = U.getf, U.geti
     local getfa, getia = U.getfa, U.getia
@@ -380,6 +402,8 @@ function Sim.read()
     D.nav2_freq   = geti(H.nav2_freq, 0)
     D.nav1_type   = geti(H.nav1_type, 0)
     D.nav2_type   = geti(H.nav2_type, 0)
+    D.nav1_loc, D.nav1_gs, D.nav1_sta = Sim.nav_flags(D.nav1_type, D.nav1_freq)
+    D.nav2_loc, D.nav2_gs, D.nav2_sta = Sim.nav_flags(D.nav2_type, D.nav2_freq)
     D.nav1_show_h = geti(H.nav1_show_h, 0)
     D.nav2_show_h = geti(H.nav2_show_h, 0)
     D.nav1_brg    = getf(H.nav1_brg, 0)
