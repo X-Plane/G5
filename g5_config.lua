@@ -101,12 +101,9 @@ local PAGES = {
         info("Installation Type", "Certified Instrument"),
         info("Unit", function() return "SFD" .. (Cfg.hooks and Cfg.hooks.n or 1) end),
         info("Software Version", Cfg.VERSION),
-        info("Role", function()
-            local r = st.role_eff
-            if r == "slave" then return "Slave" end
-            if r == "takeover" then return "Master (take-over)" end
-            return "Master"
-        end),
+        -- the unit's configured role (unit<n>_role); not st.role_eff, which
+        -- is the acting role and counts a unit in configuration mode as down
+        info("Role", function() return cfg.role == 0 and "Master" or "Slave" end),
         status("SFD1", function() return Cfg.hooks.unit_ok(1) end),
         status("SFD2", function() return Cfg.hooks.unit_ok(2) end,
             function() return Cfg.hooks.n_units() >= 2 end),
