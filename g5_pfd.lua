@@ -48,8 +48,39 @@ local function nav_color(D)
 end
 P.nav_color = nav_color
 
-local function nav_type(D)
-    return (D.hsi_src == 1) and D.nav2_type or D.nav1_type
+-- The selected receiver's tuned localizer belongs to an ILS (type bit 8 or 32).
+-- A localizer-only station (16) or a frequency-fallback localizer (type 0,
+-- nothing received) is not. Not gated on the glideslope flag (F4b).
+function P.nav_ils(D, rx)
+    if rx == nil then
+        if D.hsi_src == 1 then rx = 2 else rx = 1 end
+    end
+    local t = D.nav1_type or 0
+    if rx == 2 then t = D.nav2_type or 0 end
+    return math.floor(t / 8) % 2 == 1 or math.floor(t / 32) % 2 == 1
+end
+
+-- The selected receiver's localizer / glideslope state (F4, issue #5). rx 1 or 2,
+-- default: the HSI source's receiver (NAV2 for source 1, else NAV1; GPS callers
+-- must test hsi_src themselves). Returns loc, gs_ok:
+--   loc   a localizer is tuned (D.navN_loc, Sim.nav_flags)
+--   gs_ok a glideslope is usable: the type has the glideslope bit (D.navN_gs)
+--         and X-Plane's navN_flag_glideslope (glideslope expected, not received)
+--         is down. X-Plane draws a vertical scale for every localizer, so the
+--         display_vertical flag says nothing about it.
+function P.nav_gs_ok(D, rx)
+    if rx == nil then
+        if D.hsi_src == 1 then rx = 2 else rx = 1 end
+    end
+    local loc, gs, flag
+    if rx == 2 then
+        loc, gs, flag = D.nav2_loc, D.nav2_gs, D.nav2_gs_flag
+    else
+        loc, gs, flag = D.nav1_loc, D.nav1_gs, D.nav1_gs_flag
+    end
+    local ok = false
+    if gs == true and (flag or 0) == 0 then ok = true end
+    return loc == true, ok
 end
 
 -- a localizer is tuned on the selected navigator: g5_sim reads it from the
@@ -58,8 +89,8 @@ end
 -- (Sim.nav_flags). A VOR is not a localizer.
 -- Source label, AFCS word and "NO LOC" all use this.
 local function loc_tuned(D)
-    if D.hsi_src == 1 then return D.nav2_loc == true end
-    return D.nav1_loc == true
+    local loc = P.nav_gs_ok(D)
+    return loc
 end
 P.loc_tuned = loc_tuned
 
@@ -1362,12 +1393,15 @@ end
 local function vdi(D, st)
     local x = VDI_X
     local vn = P.vnav(D, st)
+    -- a localizer source without a usable glideslope: NO GS, no diamond (issue #5)
+    local loc, gs_ok = P.nav_gs_ok(D)
+    local nogs = D.hsi_src ~= 2 and loc and not gs_ok
     if vn then
         G.pic("Vert_GS_Box", x, VDI_Y)
         G.rstr_c(G.rfont("bold", 8), "V", x, VDI_Y + 45, C.magenta)
         -- interior: x 221..232, below the label cell (y 72.5 .. 169.5)
         P.vnav_chevron(x - 5.5, VDI_C, VDI_DOT, vn, VDI_Y - 55.5, VDI_Y + 41.5)
-    elseif D.hsi_show_v ~= 0 then
+    elseif D.hsi_show_v ~= 0 and not nogs then
         local col = nav_color(D)
         G.pic("Vert_GS_Box", x, VDI_Y)
         -- hsi_vdef > 0 = aircraft above the path (X-Plane, KLAF ILS 10, 2026-10-29:
@@ -1377,8 +1411,7 @@ local function vdi(D, st)
         -- label cell: magenta "G" for a GPS glidepath, empty for an ILS
         -- glideslope (figures 2-23, 2-25)
         if D.hsi_src == 2 then G.rstr_c(G.rfont("bold", 8), "G", x, VDI_Y + 45, C.magenta) end
-    elseif (D.hsi_src == 2 and D.no_gp) or (D.hsi_src ~= 2 and loc_tuned(D)
-            and not (D.hsi_src == 1 and D.nav2_gs or D.hsi_src ~= 1 and D.nav1_gs)) then
+    elseif (D.hsi_src == 2 and D.no_gp) or nogs then
         -- NO GS (a localizer without a glideslope) and NO GP (the GPS approach
         -- lost its glidepath, D.no_gp): the manual has no NO GP figure, so it
         -- looks like NO GS (our rule)
@@ -1770,7 +1803,6 @@ end
 function P.afcs_modes(D, st)
     local m = {}
     local gps = D.hsi_src == 2
-    local t = nav_type(D)
     local loc = loc_tuned(D)
     local function navword() return gps and "GPS" or (loc and "LOC" or "VOR") end
     local ground = (D.on_ground or 0) ~= 0
@@ -1818,10 +1850,11 @@ function P.afcs_modes(D, st)
     -- armed vertical words, up to two (real unit after APPR: "PIT GS ALTS"):
     -- the approach glideslope / glidepath, then one of ALTV / VNAV / ALTS.
     -- GS arms with an approach on a VOR / LOC source (X-Plane's S-TEC only
-    -- reports approach_status), or from X-Plane's glideslope_status 1.
+    -- reports approach_status) when the localizer is an ILS (P.nav_ils: not a
+    -- localizer-only station, which has no glideslope), or from X-Plane's glideslope_status 1.
     local gs_active = m.vert == "GS" or m.vert == "GP"
     local gs_armed = not gs_active and (D.gs_status == 1 or D.gs_armed ~= 0
-        or (D.apr_status ~= 0 and (gps or loc)) or ((D.gs_status == 2 or D.alt_mode == 8) and D.hsi_show_v == 0))
+        or (D.apr_status ~= 0 and (gps or (loc and P.nav_ils(D)))) or ((D.gs_status == 2 or D.alt_mode == 8) and D.hsi_show_v == 0))
     -- GP (GPS source) only with evidence that the approach has a glidepath
     -- (Pilot's Guide 3.3.4.7: LPV, LP+V, LNAV/VNAV, LNAV+V; an LNAV approach
     -- has none). Our rule, positive evidence only: X-Plane's own GPS arms the

@@ -120,6 +120,10 @@ local REFS = {
     nav2_freq    = "sim/cockpit2/radios/actuators/nav2_frequency_hz",
     nav1_type    = "sim/cockpit2/radios/indicators/nav1_type",
     nav2_type    = "sim/cockpit2/radios/indicators/nav2_type",
+    -- EFIS style glideslope flag per receiver: up when a glideslope is expected but
+    -- not received (F4, issue #5; hsi_flag_glideslope_pilot is not tied to the HSI source)
+    nav1_gs_flag = "sim/cockpit2/radios/indicators/nav1_flag_glideslope",
+    nav2_gs_flag = "sim/cockpit2/radios/indicators/nav2_flag_glideslope",
     nav1_show_h  = "sim/cockpit2/radios/indicators/nav1_display_horizontal",
     nav2_show_h  = "sim/cockpit2/radios/indicators/nav2_display_horizontal",
     nav1_brg     = "sim/cockpit2/radios/indicators/nav1_bearing_deg_mag",
@@ -402,6 +406,8 @@ function Sim.read()
     D.nav2_freq   = geti(H.nav2_freq, 0)
     D.nav1_type   = geti(H.nav1_type, 0)
     D.nav2_type   = geti(H.nav2_type, 0)
+    D.nav1_gs_flag = geti(H.nav1_gs_flag, 0)
+    D.nav2_gs_flag = geti(H.nav2_gs_flag, 0)
     D.nav1_loc, D.nav1_gs, D.nav1_sta = Sim.nav_flags(D.nav1_type, D.nav1_freq)
     D.nav2_loc, D.nav2_gs, D.nav2_sta = Sim.nav_flags(D.nav2_type, D.nav2_freq)
     D.nav1_show_h = geti(H.nav1_show_h, 0)

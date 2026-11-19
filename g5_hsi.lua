@@ -170,13 +170,16 @@ end
 local function vdi(D, st)
     local x = 296
     local vn = Pfd.vnav(D, st)
+    -- a localizer source without a usable glideslope: NO GS, no diamond (issue #5)
+    local loc, gs_ok = Pfd.nav_gs_ok(D)
+    local nogs = D.hsi_src ~= 2 and loc and not gs_ok
     if vn then
         -- VNAV path (Pfd.vnav): "V" in the label cell, the chevron's apex on
         -- the box's left inner edge (x 290.5), clipped below the label cell
         G.pic("Vert_GS_Box", x, CY)
         G.rstr_c(G.rfont("bold", 8), "V", x, CY + 46, C.magenta)
         Pfd.vnav_chevron(x - 5.5, CY, 22, vn, CY - 55.5, CY + 41.5)
-    elseif D.hsi_show_v ~= 0 then
+    elseif D.hsi_show_v ~= 0 and not nogs then
         local col = Pfd.nav_color(D)
         G.pic("Vert_GS_Box", x, CY)
         -- hsi_vdef > 0 = aircraft above the path (X-Plane, KLAF ILS 10, 2026-10-29:
@@ -190,13 +193,9 @@ local function vdi(D, st)
         -- the GPS approach lost its glidepath (g5_sim Sim.update_no_gp): no
         -- figure in the manual, drawn like NO GS (our rule)
         G.textc("NO GP", x, CY, 8, C.amber, G.JC, G.font_cond)
-    elseif D.hsi_src ~= 2 and D.hsi_show_h ~= 0 then
-        -- a localizer without a glideslope (g5_sim Sim.nav_flags)
-        local loc, gs = D.nav1_loc, D.nav1_gs
-        if D.hsi_src == 1 then loc, gs = D.nav2_loc, D.nav2_gs end
-        if loc and not gs then
-            G.textc("NO GS", x, CY, 8, C.amber, G.JC, G.font_cond)
-        end
+    elseif nogs and D.hsi_show_h ~= 0 then
+        -- a localizer without a usable glideslope (Pfd.nav_gs_ok)
+        G.textc("NO GS", x, CY, 8, C.amber, G.JC, G.font_cond)
     end
 end
 
@@ -273,7 +272,10 @@ end
 -- bottom inner corner.
 local function brg_label(v, D)
     if v == 1 then return "GPS" end
-    local w = ((v == 3) and D.nav2_loc or (v ~= 3 and D.nav1_loc)) and "LOC" or "VOR"
+    local rx = 1
+    if v == 3 then rx = 2 end
+    local loc = Pfd.nav_gs_ok(D, rx)
+    local w = loc and "LOC" or "VOR"
     if cfg.nav_count >= 2 then w = w .. ((v == 3) and "2" or "1") end
     return w
 end
